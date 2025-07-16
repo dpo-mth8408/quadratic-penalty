@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Dawut Esse
+    email: dawut.esse@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -27,7 +27,18 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
+Pkg.add("NLPModels")
+Pkg.add("ADNLPModels")
+Pkg.add("SolverCore")
+Pkg.add("Krylov")
+Pkg.add("LDLFactorizations")
+Pkg.add("PrettyTables")
 using LinearAlgebra
+using ADNLPModels
+using Krylov
+using LDLFactorizations
+using PrettyTables
+using Printf
 ```
 
 # Contexte
@@ -56,10 +67,212 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 6. votre fonction principale doit être documentée---reportez-vous à [https://docs.julialang.org/en/v1/manual/documentation](https://docs.julialang.org/en/v1/manual/documentation) ;
 7. faire afficher les informations pertinentes à chaque itération sous forme de tableau comme vu en cours.
 
+```{julia}
+using LinearAlgebra: Symmetric, triu, UnitLowerTriangular, Diagonal
+using LDLFactorizations             # ldl_analyze, ldl_factorize!
+import NLPModels: obj, grad, hess
+
+function newton_modifiee(model; eps_a=1e-5, eps_r=1e-5)
+    x       = copy(model.meta.x0)
+    n = length(x)
+    maxiter = n
+
+    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||", "α"))
+    for k in 1:maxiter
+        fval  = obj(model, x)
+        g     = grad(model, x)
+        gnorm = norm(g, Inf)
+        println(@sprintf("%4d | %12.4e | %12.4e |   -   ", k, fval, gnorm))
+        if gnorm < max(eps_a, eps_r*norm(x,Inf))
+            println("Convergence atteinte (||g|| = $gnorm)"); break
+        end
+
+        # --- préparation de H pour LDLFactorizations ---
+        Hfull = hess(model, x)           #  Hessienne (dense ou sparse)
+        Htri  = triu(Hfull)              # on garde la partie U
+        Hs    = Symmetric(Htri, :U)      # objet Symmetric “upper”
+
+        # analyse symbolique + réglage pour SPD
+        LDL       = ldl_analyze(Hs)
+        LDL.tol   = Inf
+        LDL.r1    = eps_a
+
+        # factorisation numérique
+        ldl_factorize!(Hs, LDL)
+
+        # direction par solveur LDL
+        p = - (LDL \ g)
+
+        # recherche linéaire Armijo
+        α = 1.0; ρ = 0.5; c = 1e-4
+        while obj(model, x + α*p) > fval + c*α*dot(g,p)
+            α *= ρ
+        end
+
+        x .+= α*p
+        println(@sprintf("%4d | %12.4e | %12.4e | %8.4e", k, fval, gnorm, α))
+    end
+    return x
+end
+```
 
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+using LinearAlgebra                   # pour norm, dot
+using Krylov                          # gradient conjugué pour LinearOperator
+import NLPModels: obj, grad, hess_op  # interface ADNLPModels
+
+function newton_inexacte(model; eps_a=1e-5, eps_r=1e-5)
+    x       = copy(model.meta.x0)
+    n       = length(x)
+    maxiter = n
+
+    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||", "α"))
+    for k in 1:maxiter
+        # 1) évaluation
+        fval  = obj(model, x)
+        g     = grad(model, x)
+        gnorm = norm(g, Inf)
+        println(@sprintf("%4d | %12.4e | %12.4e |   -   ", k, fval, gnorm))
+
+        # 2) critère de convergence
+        if gnorm < max(eps_a, eps_r * norm(x, Inf))
+            println("Convergence atteinte (||g|| = $gnorm)")
+            break
+        end
+
+        # 3) direction inexacte via CG de Krylov.jl
+        Hop    = hess_op(model, x)
+        tol_cg = min(0.5, sqrt(gnorm)) * gnorm
+        # cg de Krylov : tol, maxiter, linesearch
+        p, history = Krylov.cg(Hop, -g;
+                        atol    = tol_cg,
+                        rtol        = tol_cg,
+                        itmax    = n,
+                        linesearch = true)
+
+        # 4) recherche linéaire Armijo
+        α = 1.0; ρ = 0.5; c = 1e-4
+        while obj(model, x + α*p) > fval + c * α * dot(g, p)
+            α *= ρ
+        end
+
+        # 5) mise à jour
+        x .+= α * p
+        println(@sprintf("%4d | %12.4e | %12.4e | %8.4e", k, fval, gnorm, α))
+    end
+
+    return x
+end
+```
+```{julia}
+
+
+import NLPModels: obj, grad, hess, hess_op, neval_cons, jacobian
+
+"""
+quad_penalty(nlp::ADNLPModel,
+             eps_a::Float64=1e-5,
+             eps_r::Float64=1e-5;
+             solver::Symbol = :modifiee) -> GenericExecutionStats
+
+Méthode de pénalité quadratique pour problèmes à égalités :
+    min f(x)  s.t. c(x)=0
+
+Arguments :
+- `nlp`    : modèle ADNLPModel
+- `eps_a`  : tolérance absolue KKT
+- `eps_r`  : tolérance relative KKT
+- `solver`: `:modifiee` ou `:inexacte`, choisit la méthode de Newton
+
+Retourne : GenericExecutionStats avec champs :
+  status, solution, objective, primal_feas, dual_feas, iter, elapsed_time, solver_specific
+"""
+function quad_penalty(nlp::ADNLPModel,
+                      eps_a::Float64=1e-5,
+                      eps_r::Float64=1e-5;
+                      solver::Symbol = :modifiee)
+    # Constantes internes
+    σ = 2.0; η = 1e6; max_eval = 1000; max_time = 60.0; max_iter = typemax(Int)
+    solve_newton = solver == :inexacte ? newton_inexacte : newton_modifiee
+
+    # Cas sans contraintes
+    if nlp.meta.ncon == 0
+        x_sol = solve_newton(nlp; eps_a=eps_a, eps_r=eps_r)
+        return GenericExecutionStats(:first_order, nlp,
+                                     solution=x_sol,
+                                     objective=obj(nlp, x_sol),
+                                     primal_feas=0.0,
+                                     dual_feas=0.0,
+                                     iter=0,
+                                     elapsed_time=0.0,
+                                     solver_specific=Dict(:solver=>solver))
+    elseif nlp.meta.ncon != length(nlp.c(nlp.meta.x0))
+        error("quad_penalty gère uniquement contraintes d'égalité.")
+    end
+
+    # Initialisation
+    x = copy(nlp.meta.x0)
+    y = zeros(eltype(x), nlp.meta.ncon)
+    ρ = 1.0
+    iter = 0
+    t0 = time()
+
+    # Résidu KKT primal et dual
+    function kkt_res(x, y)
+        r1 = grad(nlp, x) - jacobian(nlp, x)' * y
+        r2 = nlp.c(x)
+        return norm(r1), norm(r2)
+    end
+    pr, du = kkt_res(x, y)
+    optimal = max(pr, du) ≤ eps_a && du ≤ eps_r
+    tired = neval_cons(nlp) > max_eval || (time() - t0) > max_time
+
+    @info log_header([:iter, :Fcount, :primal, :dual, :status], [Int, Int, Float64, Float64, String],
+                     hdr_override=Dict(:Fcount=>"#F", :primal=>"‖r₁‖", :dual=>"‖r₂‖"))
+
+    # Boucle de pénalité
+    while !(optimal || tired)
+        # Sous-problème pénalisé
+        nlp_q = quad_penalty_adnlp(nlp, ρ)
+        x_old = copy(x)
+        x = solve_newton(nlp_q; eps_a=eps_a, eps_r=eps_r)
+
+        # Maj multiplicateurs
+        c_old = nlp.c(x_old)
+        c_new = nlp.c(x)
+        y .-= ρ .* c_old
+
+        # Calcul KKT
+        pr, du = kkt_res(x, y)
+        optimal = max(pr, du) ≤ eps_a && du ≤ eps_r
+
+        # Ajustement ρ
+        if norm(c_new) > σ * norm(c_old)
+            ρ *= σ
+        end
+
+        iter += 1
+        elapsed = time() - t0
+        tired = neval_cons(nlp) > max_eval || elapsed > max_time || iter > max_iter || ρ >= η
+
+        @info log_row(Any[iter, neval_cons(nlp), pr, du, string(:running)])
+    end
+
+    # Statut final
+    status = optimal       ? :first_order :
+             neval_cons(nlp) > max_eval ? :max_eval   :
+             (time() - t0) > max_time ? :max_time   :
+             iter > max_iter || ρ >= η    ? :max_iter   :
+             :unknown
+
+    return GenericExecutionStats(status, nlp,
+                                 solution=x,
+                                 objective=obj(nlp, x),
+                                 primal_feas=du,
+                                 dual_feas=pr,
+                                 iter=iter,
+                                 elapsed_time=time() - t0,
+                                 solver_specific=Dict(:solver=>solver, :penalty=>ρ))
 end
 ```
 
@@ -71,7 +284,24 @@ Résoudre tous les problèmes de `test_set.jl` avec chacune de vos méthodes de 
 Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
-# votre code ici
+# === Validation numérique exhaustive ===
+include("test_set.jl")  # charge la variable test_set définie dans test_set.jl
+
+variantes = [:modifiee, :inexacte]
+results = []
+for solver in variantes
+    for nlp in test_set
+        # Résidu initial
+        y0 = zeros(eltype(nlp.meta.x0), nlp.meta.ncon)
+        init_r1 = grad(nlp, nlp.meta.x0) - jacobian(nlp, nlp.meta.x0)' * y0
+        init_r2 = nlp.c(nlp.meta.x0)
+        init_KKT = norm(vcat(init_r1, init_r2))
+        # Exécution
+        stats = quad_penalty(nlp, eps_a=1e-5, eps_r=1e-5; solver=solver)
+        final_KKT = max(stats.primal_feas, stats.dual_feas)
+        push!(results, (Variante=string(solver), Problème=get(nlp.meta, :name, "?"), n=length(nlp.meta.x0), m=nlp.meta.ncon, init_KKT=init_KKT, final_KKT=final_KKT, rho_final=stats.solver_specific[:penalty], iters=stats.iter, statut=string(stats.status)))
+    end
+end
 ```
 
 ## Résumé des résultats
@@ -92,7 +322,7 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
-# votre code ici
+pretty_table(results)
 ```
 
 ## Commentaires sur les résultats
