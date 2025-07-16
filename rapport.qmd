@@ -33,12 +33,19 @@ Pkg.add("SolverCore")
 Pkg.add("Krylov")
 Pkg.add("LDLFactorizations")
 Pkg.add("PrettyTables")
+Pkg.add("SolverTools")
+Pkg.add("SolverCore")
+Pkg.add("FiniteDiff")
 using LinearAlgebra
 using ADNLPModels
 using Krylov
 using LDLFactorizations
 using PrettyTables
 using Printf
+using Logging
+using SolverTools
+using SolverCore
+using FiniteDiff
 ```
 
 # Contexte
@@ -167,112 +174,170 @@ end
 ```{julia}
 
 
-import NLPModels: obj, grad, hess, hess_op, neval_cons, jacobian
+import NLPModels: obj, grad, hess, hess_op, neval_cons , cons , jac 
+
+
+# Fonction de transformation en problème pénalisé (Question 1)
+"""
+quad_penalty_adnlp(nlp::ADNLPModel, ρ::Real) -> ADNLPModel
+
+Retourne un nouveau ADNLPModel sans contraintes, dont l'objectif est
+f(x) + 0.5*ρ*‖c(x)‖², avec gradient et opérateur hessien augmentés.
+"""
+function quad_penalty_adnlp(nlp::ADNLPModel, ρ::Real)
+    # === 1. Fonctions auxiliaires sans Dual =============================
+    pure_c(x)   = (out = Vector{eltype(x)}(undef, nlp.meta.ncon);
+                   nlp.c!(out, x); out)
+    pure_jac(x) = FiniteDiff.jacobian(pure_c, x)  # uniquement Float64
+
+    # Objectif pénalisé
+    fquad(x)    = obj(nlp, x) + 0.5 * ρ * norm(pure_c(x))^2
+    # Gradient pénalisé (différences finies, pas d'AD)
+    gradquad(x) = FiniteDiff.gradient(fquad, x)
+    # Opérateur Hessien (matrix‑free)
+    function hessopquad(x)
+        Hop = hess_op(nlp, x)
+        J   = pure_jac(x)
+        return LinearOperator(length(x), length(x), false, false,
+            v -> Hop*v + ρ * (J' * (J*v)),
+            v -> Hop'*v + ρ * (J' * (J*v)))
+    end
+    # Hessien dense pour Newton modifiée (application de l'opérateur)
+    hessquad(x) = begin
+        Hop, n = hessopquad(x), length(x)
+        H = zeros(n,n)
+        for i in 1:n
+            e = zeros(n); e[i]=1.0; H[:,i] = Hop*e
+        end
+        H
+    end
+    # Aucune contrainte
+    zero_c(x) = zeros(eltype(x), 0)
+
+    return ADNLPModel(
+        fquad,
+        nlp.meta.x0,
+        zero_c, zeros(0), zeros(0);
+        grad    = gradquad,
+        jac     = pure_jac,          # jacobienne Float64 (FiniteDiff)
+        hess_op = hessopquad,
+        hess    = hessquad,
+        name    = "quad_penalty(ρ=$(ρ))"
+    )
+end
+
 
 """
-quad_penalty(nlp::ADNLPModel,
-             eps_a::Float64=1e-5,
-             eps_r::Float64=1e-5;
-             solver::Symbol = :modifiee) -> GenericExecutionStats
+KKT_eq_constraint(nlp::ADNLPModel, x::AbstractVector, y::AbstractVector)
 
-Méthode de pénalité quadratique pour problèmes à égalités :
-    min f(x)  s.t. c(x)=0
-
-Arguments :
-- `nlp`    : modèle ADNLPModel
-- `eps_a`  : tolérance absolue KKT
-- `eps_r`  : tolérance relative KKT
-- `solver`: `:modifiee` ou `:inexacte`, choisit la méthode de Newton
-
-Retourne : GenericExecutionStats avec champs :
-  status, solution, objective, primal_feas, dual_feas, iter, elapsed_time, solver_specific
+Calcule les résidus des conditions KKT pour un problème à égalités :
+  r₁ = ∇f(x) − J(x)ᵀ y   (stationnarité)
+  r₂ = c(x)             (faisabilité)
+Retour : (r1, r2)
 """
+function KKT_eq_constraint(nlp::ADNLPModel, x::AbstractVector, y::AbstractVector)
+    # Jacobien des contraintes J(x)
+    J = jac(nlp, x)  # evaluates ∇c(x)
+    # Résidu dual (stationnarité)
+    r1 = grad(nlp, x) - J' * y
+    # Résidu primal (faisabilité c(x)=0)
+    r2 = cons(nlp, x)
+    return r1, r2
+end
+
 function quad_penalty(nlp::ADNLPModel,
                       eps_a::Float64=1e-5,
                       eps_r::Float64=1e-5;
-                      solver::Symbol = :modifiee)
-    # Constantes internes
-    σ = 2.0; η = 1e6; max_eval = 1000; max_time = 60.0; max_iter = typemax(Int)
+                      solver::Symbol = :modifiee) :: GenericExecutionStats
+    # Hyperparamètres internes
+    σ        = 2.0
+    η        = 1e6
+    max_eval = 1000
+    max_time = 60.0
+    max_iter = typemax(Int)
+
+    # Choix du solveur Newton
     solve_newton = solver == :inexacte ? newton_inexacte : newton_modifiee
 
     # Cas sans contraintes
     if nlp.meta.ncon == 0
         x_sol = solve_newton(nlp; eps_a=eps_a, eps_r=eps_r)
-        return GenericExecutionStats(:first_order, nlp,
-                                     solution=x_sol,
-                                     objective=obj(nlp, x_sol),
-                                     primal_feas=0.0,
-                                     dual_feas=0.0,
-                                     iter=0,
-                                     elapsed_time=0.0,
-                                     solver_specific=Dict(:solver=>solver))
-    elseif nlp.meta.ncon != length(nlp.c(nlp.meta.x0))
-        error("quad_penalty gère uniquement contraintes d'égalité.")
+        return return GenericExecutionStats(nlp;
+                                  status = :first_order,
+                                  solution = x_sol,
+                                  objective = obj(nlp,x_sol),
+                                  primal_feas = 0.0,
+                                  dual_feas   = 0.0,
+                                  iter = 0,
+                                  elapsed_time = 0.0,
+                                  solver_specific = Dict(:solver=>solver))
+    elseif nlp.meta.ncon != length(cons(nlp, nlp.meta.x0))
+        error("quad_penalty ne gère que contraintes d’égalité.")
     end
 
     # Initialisation
-    x = copy(nlp.meta.x0)
-    y = zeros(eltype(x), nlp.meta.ncon)
-    ρ = 1.0
-    iter = 0
-    t0 = time()
+    x      = copy(nlp.meta.x0)
+    y      = zeros(eltype(x), nlp.meta.ncon)
+    ρ      = 1.0
+    iter   = 0
+    t0     = time()
 
-    # Résidu KKT primal et dual
-    function kkt_res(x, y)
-        r1 = grad(nlp, x) - jacobian(nlp, x)' * y
-        r2 = nlp.c(x)
-        return norm(r1), norm(r2)
-    end
-    pr, du = kkt_res(x, y)
-    optimal = max(pr, du) ≤ eps_a && du ≤ eps_r
-    tired = neval_cons(nlp) > max_eval || (time() - t0) > max_time
+    # Évaluation KKT initiale
+    r1_vec, r2_vec = KKT_eq_constraint(nlp, x, y)
+    pr = norm(r1_vec)
+    du = norm(r2_vec)
+    optimal = pr ≤ eps_a && du ≤ eps_r
+    tired   = neval_cons(nlp) > max_eval || (time() - t0) > max_time
 
-    @info log_header([:iter, :Fcount, :primal, :dual, :status], [Int, Int, Float64, Float64, String],
-                     hdr_override=Dict(:Fcount=>"#F", :primal=>"‖r₁‖", :dual=>"‖r₂‖"))
+    @info log_header([:iter, :F, :primal, :dual, :status],
+                     [Int, Int, Float64, Float64, String],
+                     hdr_override=Dict(:F=>"#F", :primal=>"‖r₁‖", :dual=>"‖r₂‖"))
 
     # Boucle de pénalité
     while !(optimal || tired)
-        # Sous-problème pénalisé
+        @info log_row(Any[iter, neval_cons(nlp), pr, du, string(:running)])
+
+        # 1) construire sous-problème pénalisé
         nlp_q = quad_penalty_adnlp(nlp, ρ)
+
+        # 2) résoudre sous-problème
         x_old = copy(x)
-        x = solve_newton(nlp_q; eps_a=eps_a, eps_r=eps_r)
+        x     = solve_newton(nlp_q; eps_a=eps_a, eps_r=eps_r)
 
-        # Maj multiplicateurs
-        c_old = nlp.c(x_old)
-        c_new = nlp.c(x)
-        y .-= ρ .* c_old
+        # 3) mise à jour des multiplicateurs
+        c_old = cons(nlp, x_old)
+        y    .-= ρ .* c_old
 
-        # Calcul KKT
-        pr, du = kkt_res(x, y)
-        optimal = max(pr, du) ≤ eps_a && du ≤ eps_r
+        # 4) recalcul des résidus KKT
+        r1_vec, r2_vec = KKT_eq_constraint(nlp, x, y)
+        pr = norm(r1_vec)
+        du = norm(r2_vec)
+        optimal = pr ≤ eps_a && du ≤ eps_r
 
-        # Ajustement ρ
+        # 5) ajustement du paramètre de pénalité
+        c_new = cons(nlp, x)
         if norm(c_new) > σ * norm(c_old)
             ρ *= σ
         end
 
-        iter += 1
+        # 6) incrément des compteurs
+        iter   += 1
         elapsed = time() - t0
-        tired = neval_cons(nlp) > max_eval || elapsed > max_time || iter > max_iter || ρ >= η
-
-        @info log_row(Any[iter, neval_cons(nlp), pr, du, string(:running)])
+        tired   = neval_cons(nlp) > max_eval || elapsed > max_time || iter > max_iter || ρ ≥ η
     end
 
     # Statut final
-    status = optimal       ? :first_order :
-             neval_cons(nlp) > max_eval ? :max_eval   :
-             (time() - t0) > max_time ? :max_time   :
-             iter > max_iter || ρ >= η    ? :max_iter   :
-             :unknown
+    status = optimal ? :first_order : :max_iter
 
-    return GenericExecutionStats(status, nlp,
-                                 solution=x,
-                                 objective=obj(nlp, x),
-                                 primal_feas=du,
-                                 dual_feas=pr,
-                                 iter=iter,
-                                 elapsed_time=time() - t0,
-                                 solver_specific=Dict(:solver=>solver, :penalty=>ρ))
+    return GenericExecutionStats(nlp;
+                                  status = status,
+                                  solution = x,
+                                  objective = obj(nlp,x),
+                                  primal_feas = du,
+                                  dual_feas   = pr,
+                                  iter = iter,
+                                  elapsed_time = time()-t0,
+                                  solver_specific = Dict(:solver=>solver,:penalty=>ρ))
 end
 ```
 
@@ -286,20 +351,40 @@ Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 ```{julia}
 # === Validation numérique exhaustive ===
 include("test_set.jl")  # charge la variable test_set définie dans test_set.jl
+import NLPModels: obj, grad, hess, hess_op, neval_cons , cons , jac 
+
+# === Validation numérique exhaustive ===
+
 
 variantes = [:modifiee, :inexacte]
 results = []
 for solver in variantes
     for nlp in test_set
         # Résidu initial
-        y0 = zeros(eltype(nlp.meta.x0), nlp.meta.ncon)
-        init_r1 = grad(nlp, nlp.meta.x0) - jacobian(nlp, nlp.meta.x0)' * y0
-        init_r2 = nlp.c(nlp.meta.x0)
+        x0 = nlp.meta.x0
+        y0 = zeros(eltype(x0), nlp.meta.ncon)
+        # Stationnarité initiale via jac(nlp,x)
+        J0      = jac(nlp, x0)
+        init_r1 = grad(nlp, x0) - J0' * y0
+        # Faisabilité initiale
+        init_r2 = cons(nlp, x0)
         init_KKT = norm(vcat(init_r1, init_r2))
-        # Exécution
-        stats = quad_penalty(nlp, eps_a=1e-5, eps_r=1e-5; solver=solver)
+
+        # Exécution de la pénalité quadratique
+        stats = quad_penalty(nlp; solver=solver)
         final_KKT = max(stats.primal_feas, stats.dual_feas)
-        push!(results, (Variante=string(solver), Problème=get(nlp.meta, :name, "?"), n=length(nlp.meta.x0), m=nlp.meta.ncon, init_KKT=init_KKT, final_KKT=final_KKT, rho_final=stats.solver_specific[:penalty], iters=stats.iter, statut=string(stats.status)))
+
+        push!(results, (
+            Variante  = string(solver),
+            Problème  = (hasproperty(nlp.meta, :name) ? nlp.meta.name : "?"),
+            n         = length(x0),
+            m         = nlp.meta.ncon,
+            init_KKT  = init_KKT,
+            final_KKT = final_KKT,
+            rho_final = stats.solver_specific[:penalty],
+            iters     = stats.iter,
+            statut    = string(stats.status)
+        ))
     end
 end
 ```
@@ -322,7 +407,7 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
-pretty_table(results)
+pretty_table(last(results, 5))        # joli tableau des 5 dernières lignes
 ```
 
 ## Commentaires sur les résultats
