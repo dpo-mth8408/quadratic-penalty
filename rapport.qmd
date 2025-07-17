@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Nicolas Jouglet
+    email: nicolas.jouglet@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -15,6 +15,7 @@ format:
             \usepackage{eulervm}
             \usepackage{xspace}
             \usepackage[francais]{babel}
+            \usepackage{rotating}
     geometry:
       - margin=1in
     papersize: letter
@@ -26,8 +27,20 @@ engine: julia
 ```{julia}
 #| output: false
 using Pkg
-Pkg.activate("labo7_env")
-using LinearAlgebra
+Pkg.activate("labo7_env2")
+Pkg.add("NLPModels")
+Pkg.add("PrettyTables")
+Pkg.add("ADNLPModels")
+Pkg.add("NLPModelsJuMP")
+Pkg.add("SolverCore")
+Pkg.add("SolverTools")
+Pkg.add("LDLFactorizations")
+Pkg.add("Krylov")
+
+using LinearAlgebra, NLPModels, PrettyTables, Printf, ADNLPModels,LDLFactorizations
+using NLPModelsJuMP, SolverCore, Krylov
+
+
 ```
 
 # Contexte
@@ -58,8 +71,240 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 
 
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+function armijo(xk, dk, fk, gk, f)
+    slope = dot(gk, dk)  # doit être < 0
+    t = 1.0
+    while f(xk + t * dk) > fk + 1.0e-4 * t * slope
+        t /= 2
+    end
+    return t
+end
+
+function newton_inexacte(model::AbstractNLPModel, eps_a=1e-5, eps_r=1e-5)
+    n = model.meta.nvar
+    xk = copy(model.meta.x0)
+    max_iter=10*n
+
+    # Initialisation
+    fk = obj(model, xk)
+    gk = grad(model, xk)
+    gnorm = norm(gk)
+    gnorm0 = gnorm
+    MaxIter=10*n
+
+    @printf("| %3s | %12s | %10s | %8s |\n", "k", "f(x)", "||g||", "t")
+    @printf("|%s|\n", "-"^43)
+    @printf("| %3d | %12.5e | %10.3e | %8s |\n", 0, fk, gnorm, "-")
+    k=0
+    while gnorm > eps_a + eps_r * gnorm0 && k < max_iter
+
+        Hk = hess(model, xk)
+
+        # Résolution  via CG
+        dk, stats = Krylov.cg(Hk, -gk,linesearch=true)
+
+        # Recherche Armijo
+        t = armijo(xk, dk, fk, gk, xk -> obj(model, xk))
+
+        # Mise à jour
+        xk .+= t .* dk
+        fk = obj(model, xk)
+        gk = grad(model, xk)
+        gnorm = norm(gk)
+        k=k+1
+
+        @printf("| %3d | %12.5e | %10.3e | %8.2e |\n", k, fk, gnorm, t)
+    end
+
+    return (xk , fk , gnorm,max_iter)
+end
+
+
+function newton_inexacte_stats(model::AbstractNLPModel; eps_a=1e-5, eps_r=1e-5) # fonction permettant un return sous forme de GenericExecutionStats
+    xk, fk, gnorm, k = newton_inexacte(model, eps_a, eps_r)
+    return GenericExecutionStats(
+        model;
+        status = gnorm <= eps_a + eps_r * norm(grad(model, model.meta.x0)) ? :first_order : :max_iter,
+        solution = xk,
+        objective = fk,
+        iter = k
+    )
+end
+
+```
+
+
+
+
+```{julia}
+
+using ADNLPModels
+using SparseArrays
+
+function quad_penalty_adnlp(nlp::ADNLPModel, ρ::Float64) #transforme le modèle en modèle sans contrainte
+    x0 = copy(nlp.meta.x0)
+    T = eltype(x0)
+    m = nlp.meta.ncon
+
+    # Fonction pénalisée : f(x) + (ρ/2) * ‖c(x)‖²
+    f_quad(x) = begin
+        c_tmp = similar(x, m)     
+        nlp.c!(c_tmp, x)          # évalue c(x) dans le buffer
+        nlp.f(x) + (ρ / 2) * sum(abs2, c_tmp)
+    end
+
+    return ADNLPModel(f_quad, x0)  # modèle sans contraintes
+end
+
+
+```
+
+
+
+```{julia}
+using SolverTools
+
+function quad_penalty(nlp      :: ADNLPModel;
+                      x        :: AbstractVector = nlp.meta.x0,  # Point de départ
+                      ϵ        :: AbstractFloat = 1e-3,          # Tolérance KKT
+                      η        :: AbstractFloat = 1e6,           # Seuil max pour rho
+                      σ        :: AbstractFloat = 2.0,           # Facteur de croissance de rho
+                      max_eval :: Int = 1_000,                   # Nb max d'évals de contraintes
+                      max_time :: AbstractFloat = 60.,           # Temps max autorisé (en s)
+                      max_iter :: Int = 100                      # Nb max d'itérations
+                      )
+
+    # Gestion des cas sans ou avec contraintes
+    if nlp.meta.ncon == 0
+        return newton_inexacte_stats(nlp)
+    elseif nlp.meta.ncon > 0
+        # On continue normalement
+    else
+        error("Contraintes non prises en charge")
+    end
+
+    # Initialisation
+    cx = cons(nlp, x)                   # Valeur des contraintes à x
+    normcx = normcx_init =normcx_old= norm(cx)    # Norme initiale des contraintes (primal feas.)
+
+    ρ = 1.0                             # Valeur initiale de la pénalité
+    iter = 0
+    el_time = 0.0
+    tired = neval_cons(nlp) > max_eval || el_time > max_time
+    status = :unknown
+    start_time = time()
+    too_small = false
+
+    # Initialisation des multiplicateurs de Lagrange à zéro
+    y = zeros(eltype(x), nlp.meta.ncon)
+
+    # Calcul des résidus de stationnarité (dual feas.)
+    gradf = grad(nlp, x)
+    J = jac(nlp, x)
+    normdual = normdual_init = norm(gradf + J' * y)
+
+    # Condition d’optimalité initiale (KKT)
+    optimal = normcx ≤ ϵ && normdual ≤ ϵ
+
+    # Affichage du tableau des itérations
+    @info log_header([:iter, :nf, :primal, :status, :nd, :Δ],
+        [Int, Int, Float64, String, Float64, Float64],
+        hdr_override=Dict(:nf => "#F", :primal => "‖F(x)‖", :nd => "‖d‖"))
+
+    # Boucle principale de la méthode de pénalité
+    while !(optimal || tired || too_small)
+
+        # Création du problème pénalisé pour la valeur actuelle de rho
+        nlp_quad = quad_penalty_adnlp(nlp, ρ)
+
+        # Résolution du sous-problème avec Newton inexact
+        stats = newton_inexacte_stats(nlp_quad)
+
+        # Si le sous-problème converge, on met à jour x et les résidus
+        if stats.status == :first_order
+            x = stats.solution
+            cx = cons(nlp, x)
+            normcx_old = normcx
+            normcx = norm(cx)
+        end
+
+        # Mise à jour des résidus duals (gradient du Lagrangien)
+        gradf = grad(nlp, x)
+        J = jac(nlp, x)
+        normdual = norm(gradf + J' * y)
+
+        # Si les contraintes ne sont pas assez satisfaites, augmenter ρ
+        if normcx > 0.001*ϵ
+            ρ *= σ
+            nlp_quad = quad_penalty_adnlp(nlp, ρ)
+        end
+
+        # Critère de stagnation (si direction trop petite, optionnel)
+        if abs(normcx - normcx_old) < 1e-9
+        too_small = true
+        end
+
+        # Affichage des infos à chaque itération
+        @info log_row(Any[iter, neval_cons(nlp), normcx, stats.status])
+
+        # Mise à jour des conditions d'arrêt
+        el_time = time() - start_time
+        iter += 1
+        many_evals = neval_cons(nlp) > max_eval
+        iter_limit = iter > max_iter
+        tired = many_evals || el_time > max_time || iter_limit || ρ ≥ η
+        optimal = normcx ≤ ϵ && normdual ≤ ϵ
+    end
+
+    # Détermination du statut final
+    status = if optimal 
+        :first_order
+    elseif tired
+        if neval_cons(nlp) > max_eval
+            :max_eval
+        elseif el_time > max_time
+            :max_time
+        elseif iter > max_iter
+            :max_iter
+        else
+            :unknown
+        end
+    elseif too_small
+        :stalled
+    else
+        :unknown
+    end
+
+    # Compte des évaluations
+    n_eval_f = neval_obj(nlp)
+    n_eval_c = neval_cons(nlp)
+
+    # Mise à jour finale des multiplicateurs de Lagrange
+    if nlp.meta.ncon > 0
+        gradf = grad(nlp, x)
+        J = jac(nlp, x)
+        y = - (J * J') \ (J * gradf)
+    end
+
+    # Renvoi d’un objet contenant toutes les infos d’exécution
+    return GenericExecutionStats(
+        nlp,
+        status = status,
+        solution = x,
+        objective = obj(nlp, x),
+        primal_feas = normcx,
+        dual_feas = normdual,
+        iter = iter, 
+        elapsed_time = el_time,
+        solver_specific = Dict(
+            :penalty => ρ,
+            :kkt => max(normcx, normdual),
+            :kkt_init => max(normcx_init, normdual_init),
+            :n_eval_f => n_eval_f,
+            :n_eval_c => n_eval_c,
+            :norm_y => norm(y)
+        )
+    )
 end
 ```
 
@@ -71,8 +316,17 @@ Résoudre tous les problèmes de `test_set.jl` avec chacune de vos méthodes de 
 Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
-# votre code ici
+#| output: false
+using NLPModels, PrettyTables
+include("test_set.jl")
+
+results = [
+    (nlp.meta.name, length(nlp.meta.x0), nlp.meta.ncon, quad_penalty(nlp))
+    for nlp in test_set
+]
+
 ```
+
 
 ## Résumé des résultats
 
@@ -91,10 +345,76 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 
 Le module `PrettyTables.jl` pourrait être utile.
 
-```{julia}
-# votre code ici
+ ```{julia}
+
+using PrettyTables
+
+
+function print_summary_table(results, title; backend=Val(:text))
+    header = (
+        ["Nom","Statut", "Nb vars", "Nb contraintes", "KKT initial", "KKT fin", "‖y‖", "rho final", "Nb Itérations", "Éval. totales "]
+    )
+
+    data_rows = []
+
+    for (name, nvar, ncon, r) in results
+    y = get(r.solver_specific, :norm_y, missing)
+    rho = get(r.solver_specific, :penalty, missing)
+    kkt_init = get(r.solver_specific, :kkt_init, missing)
+    n_eval_f = get(r.solver_specific, :n_eval_f, 0)
+    n_eval_c = get(r.solver_specific, :n_eval_c, 0)
+
+    push!(data_rows, [
+        name[1:min(end, 10)],
+        string(r.status),
+        nvar,
+        ncon,
+        round(kkt_init, sigdigits=3),
+        round(r.primal_feas, sigdigits=3),
+        round(norm(y), sigdigits=3),
+        rho,
+        r.iter,
+        n_eval_f + n_eval_c,
+    ])
+end
+
+
+
+    matrice = reduce(vcat, [permutedims(row) for row in data_rows])
+
+    println("\n$title\n")
+
+    tableau= pretty_table(
+        matrice;
+        header = header,
+        tf = tf_unicode,
+        crop = :none,
+        title = title,
+        formatters = ft_printf("%.5f"),
+    )
+
+    return tableau
+end 
+
 ```
+
+
+
+
+```{julia}
+
+ print_summary_table(results,"tableau résumé")
+
+```
+
+
 
 ## Commentaires sur les résultats
 
-<!-- Insérer ici votre évaluation des résultats -->
+
+Pour le critère de KKT j'ai pris le maximum entre la norme duale et la norme des contraintes. On peut remarquer sur le tableaux que les critères de KKt ont bien tendance à diminuer jusqu'à atteindre le seuil, certains atteignent ainsi le statut first_order tandisque des raisons que je ne peux expliquer le statut de certains problèmes reste sur unknown ou stalled. 
+
+
+On observe que la norme du vecteur y tend à augmenter fortement avec le paramètre de pénalité ρ. C’est un phénomène attendu car en théorie, y≈ρc(x), et la méthode n’impose pas explicitement de bornes sur y.
+
+Je n'ai pas réussi à tout print mais le tableau créé contient bien tous les critères demandés. Les noms ont étét tronqué afin d'afficher plus de colonnes.
