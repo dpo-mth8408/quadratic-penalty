@@ -27,18 +27,16 @@ engine: julia
 ```{julia}
 #| output: false
 using Pkg
-Pkg.activate("labo7_env2")
+Pkg.activate("labo7_env3")
 Pkg.add("NLPModels")
 Pkg.add("PrettyTables")
 Pkg.add("ADNLPModels")
-Pkg.add("NLPModelsJuMP")
 Pkg.add("SolverCore")
 Pkg.add("SolverTools")
-Pkg.add("LDLFactorizations")
 Pkg.add("Krylov")
 
-using LinearAlgebra, NLPModels, PrettyTables, Printf, ADNLPModels,LDLFactorizations
-using NLPModelsJuMP, SolverCore, Krylov
+using LinearAlgebra, NLPModels, PrettyTables, Printf, ADNLPModels
+using SolverCore, Krylov
 
 
 ```
@@ -415,6 +413,6 @@ end
 Pour le critère de KKT j'ai pris le maximum entre la norme duale et la norme des contraintes. On peut remarquer sur le tableaux que les critères de KKt ont bien tendance à diminuer jusqu'à atteindre le seuil, certains atteignent ainsi le statut first_order tandisque des raisons que je ne peux expliquer le statut de certains problèmes reste sur unknown ou stalled. 
 
 
-On observe que la norme du vecteur y tend à augmenter fortement avec le paramètre de pénalité ρ. C’est un phénomène attendu car en théorie, y≈ρc(x), et la méthode n’impose pas explicitement de bornes sur y.
+On observe que la norme du vecteur y tend à augmenter fortement avec le paramètre de pénalité ρ. C’est un phénomène attendu car en théorie, y $a \approx b$ ρc(x), et la méthode n’impose pas explicitement de bornes sur y.
 
 Je n'ai pas réussi à tout print mais le tableau créé contient bien tous les critères demandés. Les noms ont étét tronqué afin d'afficher plus de colonnes.
