@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Mouhtal Oussama
+    email: oussama-2.mouhtal@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -24,10 +24,21 @@ engine: julia
 ---
 
 ```{julia}
+#| echo: false
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
-using LinearAlgebra
+Pkg.add("ADNLPModels")
+Pkg.add("PrettyTables")
+
+using ADNLPModels
+using NLPModels
+using Test
+using Test
+using PrettyTables
+
+include("newtons.jl");
+include("test_set.jl");
 ```
 
 # Contexte
@@ -56,10 +67,153 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 6. votre fonction principale doit être documentée---reportez-vous à [https://docs.julialang.org/en/v1/manual/documentation](https://docs.julialang.org/en/v1/manual/documentation) ;
 7. faire afficher les informations pertinentes à chaque itération sous forme de tableau comme vu en cours.
 
+```{julia}
+function quad_penalty_adnlp(nlp :: ADNLPModel, ρ :: Real)
+    function f_penalized(x)
+        fx = nlp.f(x)
+        cx = zeros(eltype(x), nlp.meta.ncon)
+        nlp.c!(cx, x)
+        return fx + 0.5 * ρ * dot(cx, cx)
+    end
+
+    return ADNLPModel(
+        x -> f_penalized(x),
+        nlp.meta.x0
+    )
+end
+```
+
+
+
 
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+
+function c!(cx,x)
+return [10 * (x[2] - x[1]^2)]
+end
+hs6 = ADNLPModel!(x -> (x[1] - 1)^2, 
+                [1.0; 1.0], 
+                c!, 
+                zeros(1), zeros(1), 
+                name = "HS6")
+
+
+hs6_quad = quad_penalty_adnlp(hs6, 1.0)
+@test hs6_quad.meta.ncon == 0
+@test hs6_quad.f(hs6_quad.meta.x0) == 0.0
+```
+
+```{julia}
+function kkt_residual(nlp,x,y)
+    J = jac(nlp, x)
+    gradient = grad(nlp, x)
+    gradient = gradient - J'*y
+return norm(gradient)
+end
+```
+
+```{julia}
+"""
+    quad_penalty(nlp; x=nlp.meta.x0, ϵa=1e-3, ϵr=1e-3, σ=2.0, max_iter=100, method, print_stat=0)
+
+Résout un problème d'optimisation non linéaire sous contraintes d'égalité via la méthode de pénalisation quadratique.
+
+# Arguments
+- `nlp` : problème non linéaire avec contraintes (de type ADNLPModel)
+- `x` : point initial (par défaut `nlp.meta.x0`)
+- `ϵa`, `ϵr` : tolérances absolue et relative pour les conditions KKT
+- `σ` : facteur de croissance du paramètre de pénalité ρ
+- `max_iter` : nombre maximal d’itérations (outerloop)
+- `method` : méthode utilisée pour résoudre le problème pénalisé (`"Ipopt"`, `"Modified_Newton"`, `"Inexact_Newton"`)
+- `print_stat` : affiche les statistiques si `0`
+
+# Retour
+- `x` : solution approchée
+- `‖y‖` : norme du multiplicateur de Lagrange
+- `list_kkt` : historique des résidus KKT
+- `iter` : nombre d’itérations effectuées
+- `status` : statut de sortie (`:first_order`, `:max_iter`, `:unknown`)
+- `ρ` : valeur finale du paramètre de pénalité
+"""
+function quad_penalty(nlp ;
+                      x = nlp.meta.x0, 
+                      ϵa   = 1e-3,
+                      ϵr   = 1e-3,
+                      σ  = 2.0,
+                      max_iter =100,
+                      method,
+                      print_stat = 0)
+                      
+    ################
+    ##### Initialiser cx en x
+    cx = zeros(eltype(x), nlp.meta.ncon)# Initialiser la violation des contraintes
+    nlp.c!(cx, x)
+    ######################################################
+    normcx = normcx_old = norm(cx)
+
+    ρ = 1.
+    iter = 0  
+    status  = :unknown
+
+    y          = zeros(eltype(x), nlp.meta.ncon)
+    # fonction pour évaluer le résidus des conditions de KKT
+    kkt_normres = kkt_normres_old = kkt_residual(nlp,x,y) 
+    list_kkt = [kkt_normres]
+    optimal =  (kkt_normres < ϵa + ϵr * kkt_normres_old)   
+    iter_limit   = iter > max_iter
+    if print_stat ==0
+    @printf "%2s  %9s  %7s  %7s %7s\n" "k" "KKTres" "‖y‖" "‖c(x)‖" "rho"
+    @printf "%2d  %9.2e  %7.1e %7.1e %7s\n" iter kkt_normres norm(y) normcx ρ
+    end
+    while !(optimal || iter_limit)
+
+        nlp_quad = quad_penalty_adnlp(nlp, ρ)
+
+        # résoudre le problème pénalisé en partant du point x0 = x.
+        if method == "Ipopt"
+            stats = ipopt(nlp_quad, print_level = 0,x0=x)
+            x = stats.solution 
+        elseif method == "Modified_Newton"
+            x = newton_modifiee(nlp_quad, x)
+        elseif method == "Inexact_Newton"
+            x = newton_inexacte(nlp_quad, x)
+        end
+        ################################################
+        
+        
+        cx = nlp.c!(cx, x) 
+        y = -ρ .* cx
+        normcx_old = normcx
+        normcx = norm(cx)
+        iter        += 1
+        kkt_normres = kkt_residual(nlp,x,y)  
+        
+        if kkt_normres + normcx > ϵa + ϵr*kkt_normres_old # si il faut augmenter le paramètre de pénalité
+            ρ *= σ
+            nlp_quad   = quad_penalty_adnlp(nlp, ρ)
+        end
+        push!(list_kkt,kkt_normres)
+        if print_stat ==0
+        @printf "%2d  %9.2e  %7.1e %7.1e %7s\n" iter kkt_normres norm(y) normcx ρ
+        end
+        iter_limit   = iter > max_iter
+        ###################################################################
+        optimal      = (kkt_normres < ϵa + ϵr * kkt_normres_old)
+    end
+    
+
+    status = if optimal 
+        :first_order
+
+    elseif iter > max_iter
+            :max_iter
+    else
+        :unknown
+    end
+    if print_stat == 0
+    println("status:", status)
+    end
+    return x, norm(y),list_kkt, iter, status, ρ
 end
 ```
 
@@ -71,7 +225,14 @@ Résoudre tous les problèmes de `test_set.jl` avec chacune de vos méthodes de 
 Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
-# votre code ici
+i =0
+for nlp in test_set
+    i +=1
+    println("Problème  ", i, "  résolu avec newton modifiée")
+    quad_penalty(nlp; x =nlp.meta.x0,  ϵa  = 1e-6, ϵr  = 1e-6,σ  = 2.0, max_iter =100, method = "Modified_Newton")
+    println("Problème  ", i, "  résolu avec newton inexact")
+    quad_penalty(nlp; x =nlp.meta.x0,  ϵa  = 1e-6, ϵr  = 1e-6,σ  = 2.0, max_iter =100, method = "Inexact_Newton")
+end 
 ```
 
 ## Résumé des résultats
@@ -92,9 +253,92 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
-# votre code ici
+println("Table des statistiques pour Newton inexact")
+
+# En-têtes de colonnes
+col_names = ["nom", "nvar", "ncon", "‖r_KKT‖ (initial)",
+             "‖r_KKT‖ (final)", "‖y‖ (final)", "rho", "iterations", "status finale"]
+
+# Initialise la table vide (en tant que matrice 2D de Any)
+rows = Any[]
+i = 1
+for nlp in test_set
+    x, normy, list_kkt, iter, status, ρ = quad_penalty(nlp; 
+        x = nlp.meta.x0,
+        ϵa = 1e-6,
+        ϵr = 1e-6,
+        σ = 2.0,
+        max_iter = 100,
+        method = "Inexact_Newton",
+        print_stat = 1)
+
+    row = [i,
+           nlp.meta.nvar,
+           nlp.meta.ncon,
+           list_kkt[1],
+           list_kkt[end],
+           normy,
+           ρ,
+           iter,
+           string(status)]
+
+    push!(rows, row)    
+    i +=1
+end
+
+# Convertir en matrice
+table = reduce(vcat, [permutedims(row) for row in rows])
+
+# Afficher joliment
+pretty_table(table; header = col_names, tf = tf_markdown)
 ```
+
+
+```{julia}
+println("Table des statistiques pour Newton modifiée")
+
+# En-têtes de colonnes
+col_names = ["nom", "nvar", "ncon", "‖r_KKT‖ (initial)",
+             "‖r_KKT‖ (final)", "‖y‖ (final)", "rho", "iterations", "status finale"]
+
+# Initialise la table vide (en tant que matrice 2D de Any)
+rows = Any[]
+i = 1
+for nlp in test_set
+    x, normy, list_kkt, iter, status, ρ = quad_penalty(nlp; 
+        x = nlp.meta.x0,
+        ϵa = 1e-6,
+        ϵr = 1e-6,
+        σ = 2.0,
+        max_iter = 100,
+        method = "Modified_Newton",
+        print_stat = 1)
+
+    row = [i,
+           nlp.meta.nvar,
+           nlp.meta.ncon,
+           list_kkt[1],
+           list_kkt[end],
+           normy,
+           ρ,
+           iter,
+           string(status)]
+
+    push!(rows, row)    
+    i +=1
+end
+
+# Convertir en matrice
+table = reduce(vcat, [permutedims(row) for row in rows])
+
+# Afficher joliment
+pretty_table(table; header = col_names, tf = tf_markdown)
+```
+
+
 
 ## Commentaires sur les résultats
 
-<!-- Insérer ici votre évaluation des résultats -->
+-Premièrement, au lieu d'afficher le nom des problèmes, j’utilise des indices numériques de $1$ à $32$ afin de faciliter l’affichage du tableau.
+
+-À l’exception d’un seul cas ("HS40") (Méthode de pénalité avec Newton modifié diverge), l’algorithme de pénalisation quadratique, appliqué avec les deux variantes de la méthode de Newton, converge efficacement et résout les problèmes en un nombre faible d’itérations. De plus, les normes des résidus KKT finales sont généralement très faibles, ce qui indique une bonne qualité des solutions.
