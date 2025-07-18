@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Oihan Cordelier
+    email: oihan.cordelier@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -12,9 +12,7 @@ format:
     documentclass: article
     include-in-header:
       - text: |
-            \usepackage{eulervm}
             \usepackage{xspace}
-            \usepackage[francais]{babel}
     geometry:
       - margin=1in
     papersize: letter
@@ -27,7 +25,17 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
-using LinearAlgebra
+
+Pkg.add("NLPModels")
+Pkg.add("ADNLPModels")
+Pkg.add("SolverCore")
+Pkg.add("NLPModelsIpopt")
+
+Pkg.add("PrettyTables")
+Pkg.add("LDLFactorizations")
+Pkg.add("LinearAlgebra")
+
+using LinearAlgebra, NLPModels, ADNLPModels, SolverCore, Printf, NLPModelsIpopt, Debugger, PrettyTables, LDLFactorizations, LinearAlgebra
 ```
 
 # Contexte
@@ -57,9 +65,424 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 7. faire afficher les informations pertinentes à chaque itération sous forme de tableau comme vu en cours.
 
 
+
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
+
+"""
+    newton_modifiee(model, eps_a=1e-5, eps_r=1e-5)
+
+Return the argmin of the model's objective function using a modified Newton implementation.
+The hessian is decomposed using LDL. The diagonal matrix is forced to be definite positive.
+The descent direction is found by solving (LDL dk = -gk).
+Inexact line search is performed using Armijo line search.
+
+...
+# Arguments
+- `model::ADNLPModel`: ADNLPModel of the function to be minimized.
+- `eps_a::float=1e-5`: absolute tolerance criterion.
+- `eps_r::float=1e-5`: relative tolerance criterion.
+...
+"""
+function newton_modifiee(model; eps_a=1e-5, eps_r=1e-5, print_level=5)
+    
+    # Model starting location
+    x0 = model.meta.x0
+    dim = length(x0)
+    max_iter = 3 * dim
+
+    xk = copy(x0)
+    grad0 = grad(model, xk)
+    norm_grad0 = norm(grad0)
+    gradk = similar(xk)
+    Hk = similar(hess(model, x0))
+    Hk_sym = similar(Hk)
+    dk = similar(xk)
+
+    # Armijo parameters
+    delta = sqrt(eps())
+    armijo_tol = 1.0e-4
+    rho = 0.5
+    x_new = similar(xk)
+    f_new = 0.0
+
+    k_outer = 0
+    for k = 1:max_iter
+
+        # Exact gradient vector
+        gradk .= grad(model, xk)
+        norm_gradk = norm(gradk)
+
+        if norm_gradk <= eps_a + eps_r * norm_grad0
+            if print_level > 0
+              println("Converged in $(k-1) iterations. grad_norm= ", norm_gradk)
+            end
+            break
+        end
+
+        # Exact hessian matrix
+        Hk .= hess(model, xk)
+        Hk_sym = Symmetric(triu(Hk), :U)
+        LDL = ldl(Hk_sym)
+
+        # Modify the diagonal to ensure it is definite positive
+        # This implementation can lead to numerical instability
+        # Source: https://www.cs.nthu.edu.tw/~cherung/teaching/2011cs5321/handout3.pdf (slide 8/20)
+        # Could be vectorized for improved performance.
+        for i in 1:size(LDL.D, 1)
+            LDL.D[i, i] = max(LDL.D[i, i], delta)
+        end
+
+        # Solve the linear system to find the descent direction
+        ldiv!(dk, LDL, -gradk)
+
+        # Verify that dk is a descent direction
+        dot_gradk_dk = dot(dk, gradk)
+
+        if dot_gradk_dk >= 0
+            error("Search direction is not descent")
+        end
+
+        # For stability purposes -> normalize the descent direction if large
+        dk_norm = norm(dk)
+        if dk_norm > 1.0e2
+            dk .= dk ./ dk_norm
+            dot_gradk_dk = dot(gradk, dk)
+        end
+
+        # Inexact line search -> Armijo
+        alphak = 1.0
+        fk = obj(model, xk)
+        
+        for i in 1:50
+          x_new .= xk .+ alphak .* dk
+          f_new = obj(model, x_new)
+          if f_new <= fk + armijo_tol * alphak * dot_gradk_dk
+            break
+          end
+          alphak *= rho
+        end
+
+        xk .= x_new
+
+        if print_level > 0
+          @printf("| k= %3d | grad_norm= %10.3e | alpha= %.3e | f= %.3e |\n", k, norm_gradk, alphak, f_new)
+        end
+        k_outer = k
+    end
+    
+    if print_level > 0
+      println("Reached max iterations")
+    end
+
+    status = :unknown
+
+    return GenericExecutionStats(model; status = status, solution = xk,
+                            objective = obj(model, xk),
+                            primal_feas = 0.0,
+                            dual_feas = 0.0,
+                            iter = k_outer,
+)
+end
+
+
+
+
+"""
+    newton_modifiee_simple(model, eps_a=1e-5, eps_r=1e-5)
+
+Return the argmin of the model's objective function using a modified Newton implementation.
+The hessian is modified by adding multiple of the diagonal. The diagonal matrix is forced to be definite positive.
+
+Inexact line search is performed using Armijo line search.
+
+...
+# Arguments
+- `model::ADNLPModel`: ADNLPModel of the function to be minimized.
+- `eps_a::float=1e-5`: absolute tolerance criterion.
+- `eps_r::float=1e-5`: relative tolerance criterion.
+...
+"""
+function newton_modifiee_simple(model; eps_a=1e-5, eps_r=1e-5, print_level=5)
+    
+    # Model starting location
+    x0 = model.meta.x0
+    dim = length(x0)
+    max_iter = 10 * dim
+
+    xk = copy(x0)
+    grad0 = grad(model, xk)
+    norm_grad0 = norm(grad0)
+    gradk = similar(xk)
+    Hk = similar(hess(model, x0))
+    Hk_sym = similar(Hk)
+    dk = similar(xk)
+
+    # Armijo parameters
+    delta = sqrt(eps())
+    armijo_tol = 1.0e-4
+    rho = 0.5
+    x_new = similar(xk)
+    f_new = 0.0
+
+    k_outer = 0
+    for k = 1:max_iter
+
+        # Exact gradient vector
+        gradk .= grad(model, xk)
+        norm_gradk = norm(gradk)
+
+        if norm_gradk <= eps_a + eps_r * norm_grad0
+            if print_level > 0
+              println("Converged in $(k-1) iterations. grad_norm= ", norm_gradk)
+            end
+            break
+        end
+
+        # Exact Hessian matrix
+        Hk .= hess(model, xk)
+        Hk_sym = Symmetric(Matrix(triu(Hk)), :U)
+
+        lamb = 0.0
+        eigmin_Hk = minimum(eigvals(Hk_sym))
+        if eigmin_Hk <= 0
+            lamb = -eigmin_Hk + delta  # delta > 0 ensures strict positive definiteness
+        end
+
+        # modifies the Hessian
+        Hk_mod = Hk_sym + lamb * I
+
+        # Solve the linear system: (H + λ*I) d = -grad
+        dk .= -Hk_mod \ gradk
+
+        # Verify that dk is a descent direction
+        dot_gradk_dk = dot(dk, gradk)
+
+        # Inexact line search -> Armijo
+        alphak = 1.0
+        fk = obj(model, xk)
+        
+        for i in 1:50
+          x_new .= xk .+ alphak .* dk
+          f_new = obj(model, x_new)
+          if f_new <= fk + armijo_tol * alphak * dot_gradk_dk
+            break
+          end
+          alphak *= rho
+        end
+
+        xk .= x_new
+
+        if print_level > 0
+          @printf("| k= %3d | grad_norm= %10.3e | alpha= %.3e | f= %.3e |\n", k, norm_gradk, alphak, f_new)
+        end
+        k_outer = k
+    end
+    
+    if print_level > 0
+      println("Reached max iterations")
+    end
+
+    status = :unknown
+
+    return GenericExecutionStats(model; status = status, solution = xk,
+                            objective = obj(model, xk),
+                            primal_feas = 0.0,
+                            dual_feas = 0.0,
+                            iter = k_outer,
+)
+end
+
+```
+
+
+```{julia}
+
+# model_quad = nlp.f + 0.5*rho*norm(nlp.c!)^2
+
+#  new_model = ADNLPModel(x -> nlp.f(x) + 0.5*rho*norm(nlp.c!(x))^2, nlp.meta.x0)
+# new_model = ADNLPModel(x -> nlp.f(x) + 0.5*rho*norm(cons(nlp, x))^2, nlp.meta.x0)
+
+
+
+
+"""
+    quad_penalty_adnlp(nlp::ADNLPModel, rho::Real)
+
+Creates a new unconstrained ADNLP model. 
+The objective is penalized if the constrained are not respeced.
+
+...
+# Arguments
+- `model::ADNLPModel`: ADNLPModel of the constrained function to be minimized.
+- `rho::Real`: penalty coefficient
+...
+"""
+function quad_penalty_adnlp(nlp::ADNLPModel, rho::Real)
+    
+    x0 = nlp.meta.x0
+    f = nlp.f
+    c! = nlp.c!
+    m = nlp.meta.ncon  # number of constraints
+
+    # Define wrapper for constraint vector
+    function constraint_vector(x)
+        c_vec = zeros(eltype(x), m)
+        c!(c_vec, x)
+        return c_vec
+    end
+
+    # Define penalized objective
+    f_pen(x) = f(x) + 0.5 * rho * sum(constraint_vector(x).^2)
+
+    return ADNLPModel(f_pen, x0)
+end
+
+"""
+    KKT_eq_constraint(nlp :: AbstractNLPModel, x, y)
+
+Compute the KKT vectors.
+...
+# Arguments
+- `model::ADNLPModel`: ADNLPModel of the constrained function to be minimized.
+- `x`: current location
+- `y`: Lagrange multipliers
+...
+"""
+function KKT_eq_constraint(nlp :: AbstractNLPModel, x, y)
+  
+  primal_feas = cons(nlp, x)
+
+  grad_f = grad(nlp, x)
+  jac = jac_op(nlp, x)
+
+  dual_feas = grad_f - jac' * y
+
+  return (primal_feas, dual_feas)
+
+end
+
+"""
+    quad_penalty(model; eps_a=1.0e-5, eps_r=1.0e-5, solver="ipopt", print_level=5)
+
+Minimize a constrained function using the penality method. 
+
+...
+# Arguments
+- `model::ADNLPModel`: ADNLPModel of the constrained function to be minimized.
+- `eps_a::float=1e-5`: absolute tolerance criterion.
+- `eps_r::float=1e-5`: relative tolerance criterion.
+- `solver`: solver for the sub-problem minimization. Possible values {ipopt, modified, simple}.
+- `print_level`: controls what information is printed to the terminal. 
+...
+"""
+function quad_penalty(model; eps_a=1.0e-5, eps_r=1.0e-5, solver="ipopt", print_level=5)
   # modifier la fonction fournie en laboratoire
+
+
+  # 1. initialize the parameters x0, y0, rho0, k
+  x0 = model.meta.x0
+  xk = deepcopy(model.meta.x0)
+
+  n = model.meta.nvar
+  m = model.meta.ncon   # nb of general nonlinear constraints
+
+  if m == 0
+    if solver == "ipopt"
+      return ipopt(model, print_level=0)
+    elseif solver == "modified"
+      return newton_modifiee(model, eps_a=eps_a, eps_r=eps_r, print_level=0)
+    end
+  end
+
+  y0 = model.meta.y0    # review class notes (p. 22)
+  yk = deepcopy(y0)
+
+  rho0 = 1.0
+  rhok = rho0
+
+  ck = cons(model, x0)
+  ck_new = similar(ck)
+
+  k_max = 10*(n+m)    # review how to set max nb of iterations
+  k = 0
+
+  # 2. set tolerances -> they are already set (function arguments)
+  eps_a_k = eps_a
+  eps_r_k = eps_r
+
+  # 3. compute the KKT residuals (check convergence, stop if solutin converged)
+  primal_feas, first_order_opt = KKT_eq_constraint(model, x0, y0)
+
+  kkt0_norm = norm(vcat(first_order_opt, primal_feas))
+  kkt_norm = kkt0_norm
+
+  optimal = kkt_norm <= eps_a + eps_r*kkt0_norm
+  iter_limit = k > k_max
+
+  # @printf("|  n= %i  |  m= %i  |  rho0= %.3f  |  res0= %.3f  |\n", n, m, rho0, res0_norm)
+
+  while !(optimal || iter_limit) #kkt_norm > eps_a + eps_r * kkt0_norm && k <= k_max
+
+    # 4. solve penalized problem (start from x_k) using a modified newton method (be able to use both method)
+    nlp_quad = quad_penalty_adnlp(model, rhok)
+    nlp_quad.meta.x0 .= xk
+    
+    if solver == "ipopt"
+      stats = ipopt(nlp_quad, tol=eps_r_k, print_level=0)
+    elseif solver == "modified"
+      stats = newton_modifiee(nlp_quad, eps_a= eps_a_k, eps_r=eps_r_k, print_level=0)
+    elseif solver == "simple"
+      stats = newton_modifiee_simple(nlp_quad, eps_a=eps_a_k, eps_r=eps_r_k, print_level=0)
+    end
+
+    xk .= stats.solution
+    ck_new .= cons(model, xk)
+    ck_new_norm = norm(ck_new)
+
+    # 5. set y_k
+    yk .= -rhok * ck_new
+
+    # 6. set rho_k, tolereances, k
+    if ck_new_norm <= 0.9 * norm(ck)
+      eps_a_k *= 0.5
+      eps_r_k *= 0.5
+    else
+      rhok *= 2*rhok
+    end
+
+    k += 1
+    ck .= ck_new
+
+    primal_feas, first_order_opt = KKT_eq_constraint(model, xk, yk)
+    kkt_norm = norm(vcat(first_order_opt, primal_feas))
+
+    optimal = kkt_norm <= eps_a + eps_r*kkt0_norm
+    iter_limit = k > k_max
+
+
+    if print_level > 0
+      @printf("|  k= %i  |  kkt_norm= %.3e  | ||ck||= %.3e  |\n", k, kkt_norm, ck_new_norm)
+    end
+    
+  end
+
+  status = if optimal
+    :first_order
+  elseif iter_limit
+    :max_iter
+  else
+    :unknown
+  end
+
+  return GenericExecutionStats(model; status = status, solution = xk,
+                              objective = obj(model, xk),
+                              primal_feas = norm(primal_feas),
+                              dual_feas = norm(first_order_opt),
+                              iter = k, 
+                              elapsed_time = 0.0,
+                              multipliers = deepcopy(yk),
+                              solver_specific = Dict(:penalty => rhok, :kkt_init => kkt0_norm, :kkt_norm => kkt_norm))
+
 end
 ```
 
@@ -72,6 +495,12 @@ Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
 # votre code ici
+
+include("test_set.jl")
+
+# stats_quad = quad_penalty(test_set[0])
+# print(stats_quad)
+
 ```
 
 ## Résumé des résultats
@@ -93,8 +522,102 @@ Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
 # votre code ici
+
+debug = false
+
+header = [
+    "name",
+    "n",
+    "m",
+    "KKT init",
+    "KKT final",
+    "y_norm",
+    "rho_final",
+    "iters",
+    "f_calls",
+    "c_calls",
+    "statut",
+    "Δ ipopt"
+]
+
+function generate_data_matrix(solver="ipopt")
+
+  rows = Vector{Vector{Any}}()
+  counter = 0
+
+
+  for model in test_set
+
+      counter += 1
+      if debug && counter > 3
+        break
+      end
+
+      stats = ipopt(model, print_level=0)
+      x_ref = deepcopy(stats.solution)
+
+      stats = quad_penalty(model, solver=solver, print_level=0)
+      delta_ipopt = norm(stats.solution - x_ref)
+
+      name = model.meta.name
+      n = model.meta.nvar
+      m = model.meta.ncon
+      
+      kkt_init = stats.solver_specific[:kkt_init]
+      kkt_final = stats.solver_specific[:kkt_norm]
+      y_norm = norm(stats.multipliers)
+      rho = stats.solver_specific[:penalty]
+      iters = stats.iter
+      f_calls = neval_obj(model)
+      c_calls = neval_cons(model)
+      status = stats.status
+
+      push!(rows, [
+          name,
+          n,
+          m,
+          kkt_init,
+          kkt_final,
+          y_norm,
+          rho,
+          iters,
+          f_calls,
+          c_calls,
+          status,
+          delta_ipopt
+      ])
+  end
+
+  results = permutedims(hcat(rows...))
+
+  return results
+end
+
+println("SOLVER= ipopt")
+results = generate_data_matrix("ipopt")
+pretty_table(results; header=header, crop = :none)
+
+println("SOLVER= modified factorization newton")
+results = generate_data_matrix("modified")
+pretty_table(results; header=header, crop = :none)
+
+println("SOLVER= modified (simple) newton")
+results = generate_data_matrix("simple")
+pretty_table(results; header=header, crop = :none)
+
 ```
 
 ## Commentaires sur les résultats
 
 <!-- Insérer ici votre évaluation des résultats -->
+Il est possible de constater que l'implémentation de la pénalité quadratique réussit à résoudre la majorité des problèmes, 
+cependant quelques-uns restent non résolus, notamment le problème HS9. L'implémentation est plutôt gourmande quant 
+aux nombres d'évaluations de l'objectif et des contraintes. 
+
+Pour résoudre le sous-problème d'optimisation, 3 méthodes ont été essayées, soit: IPOPT, newton avec décomposition modifiée et 
+newton modifié en ajoutant à la diagonale de la hessienne. La méthode Newton modifiée est celle qui a résolu le plus de problèmes
+(une différence de 1 problème avec les 2 autres méthodes).
+
+Tous les résultats des instances ont été comparés avec une résolution complète avec IPOPT. Il est possible de constater que les 
+résultats sont très similaires sauf de Rosenbrock, HS40 et HS9. Il y aurait donc de possibles améliorations à apporter à l'implémentation 
+pour la rendre plus stable.
