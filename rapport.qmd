@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Chris David Fogué
+    email: Ouépiya-chris-david.fogue@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -27,7 +27,14 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
-using LinearAlgebra
+Pkg.add("NLPModels")
+Pkg.add("ADNLPModels")
+Pkg.add("SolverTools")
+Pkg.add("SolverCore")
+Pkg.add("Printf")
+Pkg.add("IterativeSolvers")
+Pkg.add("SparseArrays")
+using LinearAlgebra, ADNLPModels, NLPModels, Printf, Logging, SolverTools, Test, SparseArrays, IterativeSolvers, SolverCore
 ```
 
 # Contexte
@@ -58,8 +65,300 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 
 
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+
+function linesearch(model, x, d, grad_f)
+    t = 1.0
+    alpha=0.5
+    beta=1e-4
+    max_ls=20
+    f0 = obj(model, x)
+    g0 = dot(grad_f, d)
+    ls_iter = 0
+    
+    while true
+        ft = obj(model, x + t*d)
+        if ft ≤ f0 + beta*t*g0 || ls_iter ≥ max_ls
+            break
+        end
+        t *= alpha
+        ls_iter += 1
+    end
+    return t
+end
+
+###############################################################################
+function newton_inexacte(model; eps_a=1.0e-5, eps_r=1.0e-5)
+    n = model.meta.nvar
+    x = copy(model.meta.x0)
+    grad_f = grad(model, x)
+    gnorm0 = norm(grad_f)
+    max_iter=100
+    eta_max=0.1
+    hist = []
+    # Préallocation pour CG
+    d = similar(x)
+    r = similar(x)
+    p = similar(x)
+    Ap = similar(x)
+    z = similar(x)
+
+    @printf("\n%5s  %15s  %15s  %15s\n", "Iter", "||grad_f||", "eta_k", "f(x)")
+    @printf("%s\n", repeat("=", 58))
+    
+    
+    for k = 1:min(max_iter, 100 + 10*n)
+        hess_f = hess(model, x)
+        f_current = obj(model, x)
+        eta_k = min(eta_max, norm(grad_f)^0.5)  # Critère d'inexactitude
+        
+        
+        # Initialisation du gradient conjugué
+        d .= 0.0
+        r .= -grad_f
+        p .= r
+        rs_old = dot(r, r)
+        
+        for cg_iter = 1:min(100, 2*n) 
+            mul!(Ap, hess_f, p)
+            alpha = rs_old / dot(p, Ap)
+            d .+= alpha * p
+            r .-= alpha * Ap
+            rs_new = dot(r, r)
+            
+            if sqrt(rs_new) < eta_k * norm(grad_f)
+                break
+            end
+            
+            p .= r .+ (rs_new / rs_old) .* p
+            rs_old = rs_new
+        end
+        
+        # Recherche linéaire
+        t = linesearch(model, x, d, grad_f)
+        
+        # Mise à jour
+        x .+= t .* d
+        grad_f = grad(model, x)
+        gnorm = norm(grad_f)
+        push!(hist, (k=k, x=copy(x), grad_norm=gnorm, eta_k=eta_k, f=obj(model,x)))
+        
+        @printf("%5d  %15.6e  %15.6e  %15.6e\n", k, gnorm, eta_k, obj(model,x))
+        
+        if gnorm ≤ eps_a + eps_r * gnorm0
+            break
+        end
+    end
+    
+    println(repeat("=", 58))
+    return x, hist
+end
+
+###############################################################################
+function newton_inexacte_status(model::AbstractNLPModel; eps_a=1e-5, eps_r=1e-5)
+    xk, hist = newton_inexacte(model; eps_a=eps_a, eps_r=eps_r)  
+    fk = obj(model, xk)
+    gnorm = norm(grad(model, xk))
+    return GenericExecutionStats(
+        model;
+        status = gnorm <= eps_a + eps_r * norm(grad(model, model.meta.x0)) ? :first_order : :max_iter,
+        solution = xk,
+        objective = fk,
+        iter = length(hist)
+    )
+end
+
+#########################################################################################################################################################################
+
+function quad_penalty_adnlp(nlp::ADNLPModel, ρ::Float64) 
+
+"""
+    quad_penalty_adnlp(model::ADNLPModel, ρ::Float64) -> ADNLPModel
+
+Construit un nouveau modèle d'optimisation avec pénalité quadratique à partir d'un modèle `model` de type `ADNLPModel`.
+
+# Arguments
+- `model::ADNLPModel`: Le modèle d'optimisation différentiable original, incluant la fonction objectif `f` et les contraintes `c!`.
+- `ρ::Float64`: Le coefficient de pénalité quadratique, un scalaire positif qui pondère l'importance des contraintes dans la fonction pénalisée.
+
+# Retourne
+- Un nouvel objet `ADNLPModel` contenant une fonction objectif modifiée de la forme :
+    f_p(x) = f(x) + (ρ/2) * ||c(x)||²
+
+"""
+
+    x0 = copy(nlp.meta.x0)
+    X = eltype(x0)
+    C = nlp.meta.ncon
+    
+    f_penal(x) = begin
+        cst = similar(x, C)     
+        nlp.c!(cst, x)   
+        nlp.f(x) + 0.5 * ρ * dot(cst, cst)
+    end
+    return ADNLPModel(f_penal, x0) 
+end
+
+###############################################################################
+
+function KKT_eq_constraint(model :: AbstractNLPModel, x, y)
+
+"""
+    KKT_eq_constraint(model::AbstractNLPModel, x, y) -> (stationarity, feasibility)
+
+Calcule les résidus des conditions d'optimalité de Karush-Kuhn-Tucker (KKT) pour un problème 
+d'optimisation non-linéaire avec contraintes d'égalité uniquement.
+
+# Arguments
+- `model::AbstractNLPModel` : Le modèle d’optimisation contenant l’objectif et les contraintes.
+- `x` : Le vecteur des variables de décision, évalué à une solution candidate.
+- `y` : Le vecteur des multiplicateurs de Lagrange associés aux contraintes d'égalité.
+
+# Retourne
+Un tuple contenant :
+- `stationarity` : Le vecteur de stationnarité, correspondant au gradient de la Lagrangienne :
+    ∇f(x) + J(x)' * y
+  où ∇f(x) est le gradient de la fonction objectif, J(x) est la jacobienne des contraintes, 
+  et y est le vecteur des multiplicateurs de Lagrange.
+  
+- `feasibility` : La violation de faisabilité des contraintes d’égalité, mesurée par la norme infinie.
+"""
+
+    grad_f = grad(model, x)
+    c = cons(model, x)
+    J = jac(model, x)
+    
+    stationarity = grad_f + J' * y
+    feasibility = norm(c, Inf)
+    
+    return (stationarity, feasibility)
+end
+
+################################################################################
+
+function quad_penalty(model; eps_a=1.0e-5, eps_r=1.0e-5)
+
+"""
+    quad_penalty(model; eps_a=1.0e-5, eps_r=1.0e-5) -> GenericExecutionStats
+
+Résout un problème de programmation non linéaire sous contraintes d’égalité à l’aide de la méthode de pénalisation quadratique.
+
+# Arguments
+- `model::ADNLPModel`: Le modèle non linéaire à résoudre (avec contraintes d’égalité).
+- `eps_a::Float64=1e-5`: Tolérance absolue pour les conditions KKT (critère d’arrêt).
+- `eps_r::Float64=1e-5`: Tolérance relative pour les conditions KKT.
+
+La fonction construit une suite de problèmes pénalisés de la forme :
+φ(x) = f(x) + 0.5ρ‖c(x)‖²
+"""
+
+    # Paramètres par défaut comme dans le document original
+    x = copy(model.meta.x0)
+    ϵ = eps_a  # Tolérance pour les conditions KKT
+    η = 1e6    # Valeur maximale pour ρ
+    σ = 2.0    # Facteur d'augmentation de ρ
+    max_eval = 1_000
+    max_time = 60.0
+    max_iter = 100
+    
+    # Initialisation
+    cx = cons(model, x)
+    normcx = normcx_old = norm(cx)
+    ρ = 1.0
+    iter = 0    
+    el_time = 0.0
+    tired = neval_cons(model) > max_eval || el_time > max_time
+    status = :unknown
+    start_time = time()
+    too_small = false
+    y = zeros(eltype(x), model.meta.ncon)
+    
+    # Évaluation initiale des conditions KKT
+    (stationarity, feasibility) = KKT_eq_constraint(model, x, y)
+    optimal = norm(stationarity, Inf) ≤ ϵ && feasibility ≤ ϵ
+    
+    @printf("\n%5s  %6s  %12s  %12s  %12s  %8s\n", "Iter", "#F", "‖c(x)‖", "‖grad_L‖", "Status", "ρ")
+    @printf("%s\n", repeat("-", 64))
+
+    while !(optimal || tired || too_small)
+        # Création du problème pénalisé
+        model_quad = quad_penalty_adnlp(model, ρ)
+        
+        # Résolution du sous-problème avec Newton inexacte
+        stats = newton_inexacte_status(model_quad; eps_a=ϵ, eps_r=eps_r) 
+        
+        # Mise à jour des variables
+        if stats.status == :first_order    
+            x = stats.solution
+            cx = cons(model, x)
+            normcx_old = normcx
+            normcx = norm(cx)
+        end
+
+        # Estimation des multiplicateurs de Lagrange
+        y .= -ρ .* cx
+        
+        # Vérification des conditions d'arrêt
+        (stationarity, feasibility) = KKT_eq_constraint(model, x, y)
+        optimal = norm(stationarity, Inf) ≤ ϵ && feasibility ≤ ϵ
+        
+        # Augmentation du paramètre de pénalité
+        if normcx > 0.1 * normcx_old
+            ρ *= σ
+            if ρ > η
+                too_small = true
+            end
+        end
+    
+        @printf("%5d  %6d  %12.2e  %12.2e  %12s  %8.1e\n", 
+              iter, neval_cons(model), normcx, norm(stationarity, Inf), 
+              string(stats.status), ρ)
+        
+        el_time = time() - start_time
+        iter += 1
+        many_evals = neval_cons(model) > max_eval
+        iter_limit = iter > max_iter
+        tired = many_evals || el_time > max_time || iter_limit || ρ ≥ η
+    end
+    
+    # Compte des évaluations
+    n_eval_f = neval_obj(model)
+    n_eval_c = neval_cons(model)
+    
+    # Détermination du statut final
+    status = if optimal 
+        :first_order
+    elseif tired
+        if neval_cons(model) > max_eval
+            :max_eval
+        elseif el_time > max_time
+            :max_time
+        elseif iter > max_iter
+            :max_iter
+        else
+            :unknown
+        end
+    elseif too_small
+        :stalled
+    else
+        :unknown
+    end
+    
+    return GenericExecutionStats(
+        model,
+        status = optimal ? :first_order : :max_iter,
+        solution = x,
+        objective = obj(model, x),
+        primal_feas = normcx,
+        dual_feas = norm(stationarity, Inf),
+        iter = iter, 
+        elapsed_time = el_time,
+        solver_specific = Dict(
+            :penalty => ρ,
+            :multipliers => y,
+            :n_eval_f => n_eval_f,
+            :n_eval_c => n_eval_c
+        )
+    )
 end
 ```
 
@@ -72,6 +371,13 @@ Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
 # votre code ici
+
+include("test_set.jl")
+
+results = [
+    (nlp.meta.name, nlp.meta.nvar, nlp.meta.ncon, quad_penalty(nlp))
+    for nlp in test_set
+]
 ```
 
 ## Résumé des résultats
@@ -93,8 +399,78 @@ Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
 # votre code ici
+using PrettyTables
+
+function analyze_problem(nlp)
+    try
+        # Exécuter la méthode de pénalité quadratique
+        stats = quad_penalty(nlp)
+        
+        # Calculer les résidus KKT initiaux
+        y0 = zeros(nlp.meta.ncon)
+        (stat0, feas0) = KKT_eq_constraint(nlp, nlp.meta.x0, y0)
+        initial_kkt = max(norm(stat0, Inf), feas0)
+        
+        # Extraire les résultats finaux
+        return (
+            name = nlp.meta.name,
+            nvar = nlp.meta.nvar,
+            ncon = nlp.meta.ncon,
+            initial_kkt = initial_kkt,
+            final_kkt = max(stats.dual_feas, stats.primal_feas),
+            y_norm = norm(stats.solver_specific[:multipliers]),
+            final_rho = stats.solver_specific[:penalty],
+            iterations = stats.iter,
+            evaluations = stats.solver_specific[:n_eval_f] + stats.solver_specific[:n_eval_c],
+            status = stats.status
+        )
+    catch e
+        @warn "Échec sur $(nlp.meta.name): $e"
+        return (
+            name = nlp.meta.name,
+            nvar = nlp.meta.nvar,
+            ncon = nlp.meta.ncon,
+            initial_kkt = NaN,
+            final_kkt = NaN,
+            y_norm = NaN,
+            final_rho = NaN,
+            iterations = 0,
+            evaluations = 0,
+            status = :error
+        )
+    end
+end
+
+function load_test_set()
+    include("test_set.jl")
+    try
+        return test_set()
+    catch
+        return test_set 
+    end
+end
+
+# Analyser les problèmes
+problems = load_test_set()
+results = analyze_problem.(problems)
+
+# Afficher le tableau
+pretty_table(results,
+    header = ["Problème", "n", "m", "KKT init", "KKT final", "‖y‖", "ρ", "Iters", "Évals", "Statut"],
+    alignment = [:l, :c, :c, :r, :r, :r, :r, :c, :c, :c],
+    formatters = (ft_printf("%.1e", 4:7), ft_printf("%d", [2,3,8,9])),
+    tf = tf_markdown  # Meilleur rendu pour les rapports
+)
 ```
 
 ## Commentaires sur les résultats
 
-<!-- Insérer ici votre évaluation des résultats -->
+La méthode montre une décroissance des résidus KKT (‖grad_L‖ et ‖c(x)‖), avec plusieurs problèmes atteignant le statut `first_order` (tolérances 1e-5 remplies). Certains cas restent en `stalled` ou `unknown`, probablement dus à :
+- La progression prudente du paramètre ρ (condition : `normcx > 0.1*normcx_old`). Remarque: Cela varie en changeant le facteur      multiplicateur `0.1` par une valeur plus basse ( par exemple `1e-3`)
+- Des plateaux de convergence ou l'atteinte de `max_iter`.
+ 
+La norme des multiplicateurs de Lagrange `y` augmente avec ρ, suivant la relation théorique `y ≈ -ρc(x)`. La gestion de la valeur de ρ évite des valeurs extrêmes, favorisant la stabilité numérique.
+
+La résolution semble efficace dans l'ensemble, pour les problèmes bien conditionnés.   
+
+L'implémentation semble respecter les attentes théoriques. Les rares échecs de convergence reflètent les limites naturelles de la méthode de pénalité quadratique, qui pourraient être atténuées par des ajustements de la stratégie de pénalisation.
