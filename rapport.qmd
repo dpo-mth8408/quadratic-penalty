@@ -35,7 +35,9 @@ Pkg.add("LDLFactorizations")
 Pkg.add("PrettyTables")
 Pkg.add("SolverTools")
 Pkg.add("SolverCore")
-Pkg.add("FiniteDiff")
+Pkg.add("DataFrames")
+Pkg.add("CSV")
+Pkg.add("LinearOperators")
 using LinearAlgebra
 using ADNLPModels
 using Krylov
@@ -45,7 +47,9 @@ using Printf
 using Logging
 using SolverTools
 using SolverCore
-using FiniteDiff
+using DataFrames
+using CSV
+using LinearOperators
 ```
 
 # Contexte
@@ -185,20 +189,20 @@ Retourne un nouveau ADNLPModel sans contraintes, dont l'objectif est
 f(x) + 0.5*ρ*‖c(x)‖², avec gradient et opérateur hessien augmentés.
 """
 function quad_penalty_adnlp(nlp::ADNLPModel, ρ::Real)
-    # === 1. Fonctions auxiliaires sans Dual =============================
     pure_c(x)   = (out = Vector{eltype(x)}(undef, nlp.meta.ncon);
                    nlp.c!(out, x); out)
-    pure_jac(x) = FiniteDiff.jacobian(pure_c, x)  # uniquement Float64
+    pure_jac(x) = jac(nlp, x)  # jacobienne native ADNLPModels
 
     # Objectif pénalisé
     fquad(x)    = obj(nlp, x) + 0.5 * ρ * norm(pure_c(x))^2
-    # Gradient pénalisé (différences finies, pas d'AD)
-    gradquad(x) = FiniteDiff.gradient(fquad, x)
+    # Gradient pénalisé 
+    gradquad(x) = grad(nlp, x) + ρ * (pure_jac(x)' * pure_c(x))
+
     # Opérateur Hessien (matrix‑free)
     function hessopquad(x)
         Hop = hess_op(nlp, x)
         J   = pure_jac(x)
-        return LinearOperator(length(x), length(x), false, false,
+        return LinearOperators.LinearOperator(Float64,length(x), length(x), false, false,
             v -> Hop*v + ρ * (J' * (J*v)),
             v -> Hop'*v + ρ * (J' * (J*v)))
     end
@@ -219,7 +223,7 @@ function quad_penalty_adnlp(nlp::ADNLPModel, ρ::Real)
         nlp.meta.x0,
         zero_c, zeros(0), zeros(0);
         grad    = gradquad,
-        jac     = pure_jac,          # jacobienne Float64 (FiniteDiff)
+        jac     = pure_jac,          
         hess_op = hessopquad,
         hess    = hessquad,
         name    = "quad_penalty(ρ=$(ρ))"
@@ -303,10 +307,9 @@ function quad_penalty(nlp::ADNLPModel,
         # 2) résoudre sous-problème
         x_old = copy(x)
         x     = solve_newton(nlp_q; eps_a=eps_a, eps_r=eps_r)
-
         # 3) mise à jour des multiplicateurs
         c_old = cons(nlp, x_old)
-        y    .-= ρ .* c_old
+        y    .-= ρ .* cons(nlp, x)
 
         # 4) recalcul des résidus KKT
         r1_vec, r2_vec = KKT_eq_constraint(nlp, x, y)
@@ -316,7 +319,7 @@ function quad_penalty(nlp::ADNLPModel,
 
         # 5) ajustement du paramètre de pénalité
         c_new = cons(nlp, x)
-        if norm(c_new) > σ * norm(c_old)
+        if norm(c_new) > 0.01 * norm(c_old)
             ρ *= σ
         end
 
@@ -327,8 +330,16 @@ function quad_penalty(nlp::ADNLPModel,
     end
 
     # Statut final
-    status = optimal ? :first_order : :max_iter
-
+    status =  if optimal
+        status = :first_order
+    elseif neval_cons(nlp) > max_eval
+        status = :max_eval
+    elseif (time()-t0) > max_time
+        status = :max_time
+    else
+        status = :max_iter
+    end
+        
     return GenericExecutionStats(nlp;
                                   status = status,
                                   solution = x,
@@ -354,7 +365,8 @@ include("test_set.jl")  # charge la variable test_set définie dans test_set.jl
 import NLPModels: obj, grad, hess, hess_op, neval_cons , cons , jac 
 
 # === Validation numérique exhaustive ===
-
+stats = quad_penalty(test_set[6]; solver=:modifiee)
+@show stats.status stats.iter stats.primal_feas stats.dual_feas
 
 variantes = [:modifiee, :inexacte]
 results = []
@@ -407,9 +419,43 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
-pretty_table(last(results, 5))        # joli tableau des 5 dernières lignes
+
+function print_summary_as_matrix(results, title::String)
+    # 1) DataFrame → matrice de String
+    df = DataFrame(results)
+    mat = string.(Matrix(df))          # tout devient String
+    hdr = names(df)                    # en-têtes
+
+    # 2) Affichage textuel (pour qu’il aille dans le PDF sans couper)
+    pretty_table(
+        mat;
+        header               = hdr,          # noms de colonnes
+        title                = title,
+        tf                   = tf_unicode,   # traits Unicode
+        crop                 = :none,        # ne tronque rien
+        limit_printing       = false,        # pas de limite de colonnes
+        max_num_of_columns   = size(mat, 2), # toutes les colonnes
+        alignment            = :l,           # alignement à gauche
+        header_crayon        = Crayon(bold=true),
+        show_row_number      = true,
+        compact_printing     = false
+    )
+end
 ```
 
+```{julia}
+print_summary_as_matrix(results, "Résumé complet des variantes")
+```
+
+```{julia}
+
+using DataFrames, CSV
+df = DataFrame(results)
+CSV.write("results.csv", df)
+```
 ## Commentaires sur les résultats
 
-<!-- Insérer ici votre évaluation des résultats -->
+J’ai testé les problèmes de test_set (HS6, HS8, Rosenbrock contraint, etc.) avec mes deux variantes (newton modifiée et newton inexacte) et aucun ne converge : ni l’une ni l’autre n’atteignent les tolérances KKT, et souvent le résidu final est même plus grand qu’au départ (voire NaN). J’ai constaté que le paramètre de pénalité ρ reste bloqué à 1 dans la plupart des cas et que la mise à jour des multiplicateurs y .-= ρ .* c ne fait qu’amplifier les erreurs au lieu de les corriger.
+
+Pour améliorer les choses, je compte modifier l’actualisation des multiplicateurs en ,y←y+ρc(x nouveau),
+plus conforme à la théorie, et déclencher systématiquement ρ←σρ dès que ∥c(x)∥ dépasse un seuil fixe. Je vais aussi renforcer la résolution des sous‑problèmes (par exemple en resserrant les tolérances ou en passant à un solveur comme Ipopt) pour m’assurer que chaque étape pénalisée soit vraiment bien résolue avant de mettre à jour ρ et 𝑦.
