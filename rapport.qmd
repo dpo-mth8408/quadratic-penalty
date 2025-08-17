@@ -31,7 +31,7 @@ Pkg.add("ADNLPModels")
 Pkg.add("NLPModelsIpopt")
 Pkg.add("PrettyTables")
 Pkg.add("Printf")
-using LinearAlgebra, ADNLPModels, PrettyTables, Printf
+using LinearAlgebra, NLPModels, ADNLPModels, PrettyTables, Printf
 include("newton_modifiees.jl")
 ```
 
@@ -103,7 +103,7 @@ où Vf(x) est le gradient de la fonction objectif, J(x) est la jacobien et y est
 """ 
 function KKT_eqs_contraintes(model :: AbstractNLPModel, X, y)
   grad_fonction = grad(model, x)
-  cs = cons (model, x)
+  cs = cons(model, x)
   J = jac(model, x)
   stationarity = grad_fonction + J' * y
   feasibility = norm(cs, Inf)
