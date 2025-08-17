@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Joey Van Melle
+    email: joey.van-melle@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -27,7 +27,15 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
+Pkg.add("ADNLPModels")
+Pkg.add("NLPModels")
+Pkg.add("NLPModelsIpopt")
+Pkg.add("Ipopt")
+
 using LinearAlgebra
+Pkg.add("PrettyTables")
+using ADNLPModels, NLPModels, NLPModelsIpopt, Ipopt, PrettyTables
+using Printf
 ```
 
 # Contexte
@@ -58,8 +66,242 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 
 
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+
+####################### Modified Newton's method ###################################
+
+"""
+    calculate_max_iterations(dimension)
+
+Compute the maximum number of iterations of modified newton search based on the dimension of the problem.
+args : 
+    - dimension : the dimension of the problem.
+Returns : The maximum number of iterations (int64). 
+"""
+function calculate_max_iterations(dimension, nbr_of_operations_upper_bound=100000)
+    #Assuming the upper-bound on the complexity of matrix*vector multiplication is n^3
+    operations_per_step = dimension^3
+    return floor(nbr_of_operations_upper_bound/operations_per_step)
+end
+
+
+"""
+    armijo(x_k, descent_direction, f, gradient_x_k)
+
+Compute a length of step along a specified direction of descent to ensure a reduction in value from f(x_k) to f(x_k + t_k*d_k).
+
+args :
+    - x_k : The point from which an 'optimal' step direction is to be found (vector of float64).
+    - descent_direction : The direction of descent on which the length of the step is to be calculated (vector of float64).
+    - f : The function to be reduced (a function that returns a real number).
+    - gradient_x_k : The gradient of f at x_k (vector of float64).
+Returns : the length of the step (float64). 
+"""
+function armijo(x_k, descent_direction, f, f_x_k, gradient_x_k)
+    t_k = 1
+    while f(x_k + t_k.*descent_direction) > f_x_k + 0.8 * (gradient_x_k)' * descent_direction
+        t_k *= 0.5
+    end
+    return t_k
+end
+
+"""
+    solve_with_modified_cholesky(modified_hessian, gradient_x_k)
+
+Solves a linear problem with cholesky factorisation.
+
+args :
+    - hessian : The hessian matrix (matrix of float64).
+    - gradient_x_k : The constant vector of the linear system (vector of float64).
+Returns : a vector that solves the linear system (vector of float64)
+"""
+function solve_with_modified_cholesky(hessian, gradient_x_k)
+    H = Symmetric(triu(hessian), :U)
+    LDL = ldl_analyze(H)
+    LDL.tol = Inf
+    LDL.r1 = 1.0e-5
+    LDL = ldl_factorize!(H, LDL)
+    descent_direction = -LDL\gradient_x_k
+    return descent_direction
+end
+
+"""
+    modified_newton(f, gradient, hessian,  initial_point, eps_a, eps_r)
+
+Performs the modified newton's method on a unconstrained minimisation problem.
+args :
+    - f : The function to be minimised (function that returns a float64).
+    - gradient : The gradient of the function to be minimized (function that returns a vector of float64).
+    - initial_point : The initial point on which the search begins (vector of float64).
+    - eps_a : The absolute stop condition (float64).
+    - eps_r : The relative stop condition (float64).
+"""
+function modified_newton(f, gradient, hessian,  initial_point, eps_a, eps_r, max_iterations)
+    stop_condition = eps_a + eps_r * gradient(initial_point)
+    x_k = initial_point
+    k = 0
+    f_x_k = f(x_k)
+    gradient_x_k = gradient(initial_point)
+    @printf  "%2s  %7s %12s\n" "it" "‖∇f(x)‖" "f"
+    
+    while g > stop_condition && k < max_iterations
+        descent_direction = solve_with_modified_cholesky(hessian, gradient_x_k)
+        t_k = armijo(x_k, descent_direction, f, f_x_k, gradient_x_k)
+        x_k += t_k*descent_direction
+        gradient_x_k = gradient(x_k)
+        k +=1
+        f_x_k = f(x_k)
+        @printf  "%2s  %7s\n" k gradient_x_k f_x_k
+    end
+    if k < max_iterations
+        println("La recherche a convergée. solution:")
+        print(x_k)
+    else 
+        println("La recherche n'a pas réussi à converger.")
+    end
+end
+
+"""
+    modified_newton_wrapper(model, eps_a, eps_r)
+
+A function wrapper to use AbstractNLPModel as model on which modified newton's method is too be performed.
+args : 
+    - model : the AbrastNLPModel to be used (AbrastNLPModel).
+    - eps_a : the absolute error of the solution (float64).
+    - eps_r : the relative error of the solution (float64).
+"""
+function modified_newton_wrapper(model, eps_a, eps_r, max_iterations)
+    f(x)= obj(model, x)
+    gradient(x) = grad(model, x)
+    hessian(x) = hess(model, x)
+    initial_point = model.x0
+    return modified_newton(f, gradient, hessian, initial_point, eps_a, eps_r, max_iterations)
+end
+
+
+
+####################### quadratic penalty method ###################################
+function quad_penalty_adnlp(nlp :: ADNLPModel, ρ :: Real)
+    nlp_quad = ... # TODO
+   return nlp_quad
+end
+
+function KKT_res(nlp :: AbstractNLPMidel, x, y)
+    return norm([(grad(nlp, x) - jac(nlp, x)'y)' cons(nlp, x)']')
+end 
+
+function quad_penalty(nlp      :: ADNLPModel;
+                      x        :: AbstractVector = nlp.meta.x0, 
+                      ϵ        :: AbstractFloat = 1e-3,
+                      η        :: AbstractFloat = 1e6, 
+                      σ        :: AbstractFloat = 2.0,
+                      max_eval :: Int = 1_000, 
+                      max_time :: AbstractFloat = 60.,
+                      max_iter :: Int = typemax(Int64)
+                      )
+    # Explorer la documentation de NLPModels.jl pour valider que nlp est un problème avec contraintes d'égalité.
+    # Si il est sans contraintes, appeler directement l'une de vos méthode de Newton.
+    # Si il a d'autres types de contraintes, émettre une erreur.
+    clow = nlp.meta.clow
+    cupp = nlp.meta.cupp
+
+    neq = sum(clow .== cupp)
+    nineq = length(clow) - neq
+
+
+
+    # Regarder si le problème a des contraintes non-linéaires
+    if nieq > 0 : throw("The problem has inequality constraints.")
+    # Regarder si le problème n'a pas de contraintes
+    if length(clow) == 0: 
+      #Use newton's method
+      modified_newton_wrapper(model, eps_a, eps_r, max_iter)
+      
+    end
+
+
+    ##### Initialiser cx en x
+    cx = cons(nlp, x) #Initialiser la violation des contraintes
+    ######################################################
+    normcx = normcx_old = norm(cx)
+
+    ρ = 1.
+    iter = 0    
+    el_time = 0.0
+    tired   = neval_cons(nlp) > max_eval || el_time > max_time
+    status  = :unknown
+
+    start_time = time()
+    too_small  = false
+    y          = zeros(eltype(x), nlp.meta.ncon)
+    # appeler votre fonction pour évaluer le résidus des conditions de KKT
+    optimal    = KKT_res(nlp, x, y) ≤ ϵ
+
+    @info log_header([:iter, :nf, :primal, :status, :nd, :Δ],
+    [Int, Int, Float64, String, Float64, Float64],
+    hdr_override=Dict(:nf => "#F", :primal => "‖F(x)‖", :nd => "‖d‖"))
+
+    while !(optimal || tired || too_small)
+
+        nlp_quad   = quad_penalty_adnlp(nlp, ρ)
+
+        # Appeler Ipopt ou l'une de vos méthodes de Newton pour résoudre le problème pénalisé en partant du point x0 = x.
+        # Utiliser l'option print_level = 0 pour enlever les affichages d'ipopt.
+        opts = Dict("print_level" => 0, "tol" => ϵ + ϵ*norm(grad(nlp_quad, x)))
+        result = optimize!(nlp_quad, Ipopt.Optimizer; options=opts)
+        x_opt = nlp_quad.meta.x
+        ################################################
+
+        if norm([grad(nlp_quad, x_opt)]) <= ϵ + ϵ*norm(grad(nlp_quad, x)) # si le sous-problème a été résolu
+            x = x_opt
+            cx = cons(nlp, x)
+            y = - ρ*cons(nlp, x)
+            ##########################################################
+            normcx_old = normcx
+            normcx = norm(cx)
+        end
+        
+        if true
+            ϵ *= 0.95
+            ρ *= σ
+            nlp_quad   = quad_penalty_adnlp(nlp, ρ)
+        end
+
+        @info log_row(Any[iter, neval_cons(nlp), normcx, stats.status])
+
+        el_time      = time() - start_time
+        iter        += 1
+        many_evals   = neval_cons(nlp) > max_eval
+        iter_limit   = iter > max_iter
+        tired        = many_evals || el_time > max_time || iter_limit || ρ ≥ η
+        ###################################################################
+        optimal      = KKT_res(nlp, x, y) ≤ ϵ
+    end
+
+    status = if optimal 
+        :first_order
+    elseif tired
+        if neval_cons(nlp) > max_eval
+            :max_eval
+        elseif el_time > max_time
+            :max_time
+        elseif iter > max_iter
+            :max_iter
+        else
+            :unknown
+        end
+    elseif too_small
+        :stalled
+    else
+        :unknown
+    end
+
+    return GenericExecutionStats(status, nlp, solution = x,
+                                 objective = obj(nlp, x),
+                                 primal_feas = normcx,
+                                 dual_feas = normdual,
+                                 iter = iter, 
+                                 elapsed_time = el_time,
+                                 solver_specific = Dict(:penalty => ρ))
 end
 ```
 
@@ -71,7 +313,9 @@ Résoudre tous les problèmes de `test_set.jl` avec chacune de vos méthodes de 
 Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
-# votre code ici
+Pkg.add("ADNLPModels")
+Pkg.add("SolverCore")
+include("test_set.jl")
 ```
 
 ## Résumé des résultats
@@ -93,6 +337,36 @@ Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
 # votre code ici
+using PrettyTables
+datatable = []
+
+for problem in problems
+  data = []
+  nlp = ADNLPModel(x -> (x[1] - 1)^2, 
+                [-1.2; 1.0], 
+                x -> [10 * (x[2] - x[1]^2)], 
+                zeros(1), zeros(1), 
+                name = "HS6")
+  stats = quad_penalty(nlp)
+
+  push!(data, nlp.meta.name)
+  push!(data, nlp.meta.nvar)
+  push!(data, KKT_res(nlp, nlp.meta.x0, nlp.meta.y0))
+  push!(data, KKT_res(nlp, nlp.meta.x, nlp.meta.y))
+  push!(data, norm(nlp.meta.y))
+  push!(data, stats.penalty)
+  push!(data, stats.iterations)
+  push!(data, stats.constraint_eval_count)
+  push!(data, stats.obj_eval_count)
+  push!(data, stats.status)
+
+  vcat(datatable, data)
+
+end
+
+pretty_table(data; header = ["Nom", "nvar", "KKT res initial", "KKT res final", "norm lagrange final", "ρ final", "num iter", "num eval f", "num eval c", "statut final"])
+
+
 ```
 
 ## Commentaires sur les résultats
