@@ -3,6 +3,7 @@
 using Pkg
 Pkg.add("LDLFactorizations")
 Pkg.add("Krylov")
+Pkg.add("NLPModels")
 Pkg.add("ADNLPModels")
 
 using LinearAlgebra
