@@ -28,13 +28,15 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
+using LinearAlgebra
+Pkg.add("NLPModels")
 Pkg.add("ADNLPModels")
 Pkg.add("PrettyTables")
 
 using ADNLPModels
 using NLPModels
 using Test
-using Test
+using Printf
 using PrettyTables
 
 include("newtons.jl");
