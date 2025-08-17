@@ -2,8 +2,8 @@
 title: "Rapport de laboratoire 4"
 subtitle: "MTH8408"
 author:
-  - name: Votre nom
-    email: votre.adresse@polymtl.ca
+  - name: Amami Yasmine
+    email: yasmine.amami@polymtl.ca
     affiliation:
       - name: Polytechnique Montréal
 format:
@@ -27,7 +27,12 @@ engine: julia
 #| output: false
 using Pkg
 Pkg.activate("labo7_env")
-using LinearAlgebra
+Pkg.add("ADNLPModels")
+Pkg.add("NLPModelsIpopt")
+Pkg.add("PrettyTables")
+Pkg.add("Printf")
+using LinearAlgebra, NLPModels, ADNLPModels, PrettyTables, Printf
+include("newton_modifiees.jl")
 ```
 
 # Contexte
@@ -57,9 +62,52 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 7. faire afficher les informations pertinentes à chaque itération sous forme de tableau comme vu en cours.
 
 
+
 ```{julia}
-function quad_penalty(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # modifier la fonction fournie en laboratoire
+"""
+function penalisation_quadratique(modele::ADNLPModel, coefficient::Real)
+Construit un nouveau modèle d'optimisation avec pénalité quadratique 
+
+# Arguments
+model::ADNLPModel: Le modèle d'optimisation différentiable original
+p::Float64 : Le coefficient de pénalité quadratique, un scalaire po pénalisée.
+
+# Resultat(s)
+Un nouvel objet "ADNLPModel contenant une fonction objectif modifié
+
+"""
+function penalisation_quadratique(modele::ADNLPModel, coefficient::Real)
+    # on definit une nouvelle fonction objectif pénalisée
+    function objectif_penalise(point)
+        valeur_f = modele.f(point)                         
+        contraintes = zeros(modele.meta.ncon)              
+        modele.c!(contraintes, point)                      
+        return valeur_f + 0.5 * coefficient * dot(contraintes, contraintes)  
+    end
+
+    # on retourne un nouveau modèle avec l'objectif pénalisé
+    return ADNLPModel(objectif_penalise, modele.meta.x0)
+end
+
+
+"""
+    KKT_eqs_contraintes (model: :AbstractNLPModel, X, Y) -> (stationarity, 1) 
+    est une fonction qui calcule les résidus des conditions d'optimalité de Karush-Kuhn-Tucker (avec un k d'optimisation non-linéaire avec contraintes d'égalité uniquement.)
+
+# Resultats
+
+Un tuple contenant :
+- stationarity : Le vecteur de stationnarité, correspondant au gradient : Vf(x) + J(x) ' * y
+où Vf(x) est le gradient de la fonction objectif, J(x) est la jacobien et y est le vecteur des multiplicateurs de Lagrange.
+- feasibility : La violation de faisabilité des contraintes d'égalité,
+""" 
+function KKT_eqs_contraintes(model :: AbstractNLPModel, X, y)
+  grad_fonction = grad(model, x)
+  cs = cons(model, x)
+  J = jac(model, x)
+  stationarity = grad_fonction + J' * y
+  feasibility = norm(cs, Inf)
+  return (stationarity, feasibility)
 end
 ```
 
@@ -71,7 +119,12 @@ Résoudre tous les problèmes de `test_set.jl` avec chacune de vos méthodes de 
 Ceci vous donne deux variantes de la méthode de pénalité quadratique.
 
 ```{julia}
-# votre code ici
+nlp=ADNLPModel(x -> 2x[1]^2 + x[1] * x[2] + x[2]^2 - 9x[1] - 9x[2] + 14,
+              [1.0; 2.0],
+              x -> [4x[1] + 6x[2] - 10],
+              zeros(1), zeros(1),
+              name="Simple linear-quadratique problem")
+jac(nlp, [1.0; 2.0])
 ```
 
 ## Résumé des résultats
@@ -92,9 +145,5 @@ Pour chaque variante, produire un tableau récapitulatif qui donne, pour chaque 
 Le module `PrettyTables.jl` pourrait être utile.
 
 ```{julia}
-# votre code ici
 ```
 
-## Commentaires sur les résultats
-
-<!-- Insérer ici votre évaluation des résultats -->
