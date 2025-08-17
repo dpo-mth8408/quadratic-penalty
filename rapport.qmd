@@ -35,7 +35,7 @@ Pkg.add("PrettyTables")
 Pkg.add("LDLFactorizations")
 Pkg.add("LinearAlgebra")
 
-using LinearAlgebra, NLPModels, ADNLPModels, SolverCore, Printf, NLPModelsIpopt, Debugger, PrettyTables, LDLFactorizations, LinearAlgebra
+using LinearAlgebra, NLPModels, ADNLPModels, SolverCore, Printf, NLPModelsIpopt, PrettyTables, LDLFactorizations, LinearAlgebra
 ```
 
 # Contexte
